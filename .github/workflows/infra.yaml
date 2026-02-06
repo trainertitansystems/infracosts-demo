@@ -8,20 +8,35 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write   # REQUIRED for Workload Identity Federation
 
 jobs:
   infracost-and-gemini:
     runs-on: ubuntu-latest
+    name: infracost-and-gemini
 
     steps:
+      # --------------------------------------------------
       # Checkout PR code safely
+      # --------------------------------------------------
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      # Terraform
+      # --------------------------------------------------
+      # Authenticate to Google Cloud (WIF)
+      # --------------------------------------------------
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
+
+      # --------------------------------------------------
+      # Terraform plan
+      # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -34,20 +49,22 @@ jobs:
       - name: Export Terraform plan to JSON
         run: terraform show -json tfplan.binary > plan.json
 
-      # Infracost
+      # --------------------------------------------------
+      # Infracost (REAL COST from plan.json)
+      # --------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost
+      - name: Run Infracost breakdown
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-      - name: Infracost PR Comment
+      - name: Generate Infracost PR comment
         run: |
           infracost output \
             --path infracost.json \
@@ -61,8 +78,10 @@ jobs:
           gh pr comment ${{ github.event.pull_request.number }} \
             --body-file infracost.md
 
-      # Gemini AI
-      - name: Build Gemini prompt
+      # --------------------------------------------------
+      # Gemini AI cost & architecture review
+      # --------------------------------------------------
+      - name: Build Gemini request
         run: |
           jq -n \
             --argjson cost "$(cat infracost.json)" \
@@ -71,15 +90,16 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "You are a GCP FinOps and Cloud Architect.\n\n" +
-                    "Analyze this Terraform cost report and provide:\n" +
-                    "• Monthly cost summary\n" +
-                    "• Cost drivers\n" +
-                    "• Cheaper GCP machine alternatives\n" +
-                    "• Disk and storage optimizations\n" +
-                    "• Risks before deployment\n\n" +
+                    "You are a GCP Cloud Architect and FinOps expert.\n\n" +
+                    "Analyze the following Infracost report and provide:\n\n" +
+                    "1. Total monthly cost\n" +
+                    "2. Cost per resource\n" +
+                    "3. GCP machine types used\n" +
+                    "4. Cheaper or more efficient alternatives\n" +
+                    "5. Disk and storage optimization suggestions\n" +
+                    "6. Any risks or concerns before deployment\n\n" +
                     "Return concise markdown.\n\n" +
-                    "COST DATA:\n" + ($cost | tostring)
+                    "INFRACOST JSON:\n" + ($cost | tostring)
                   )
                 }]
               }]
