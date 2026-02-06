@@ -1,89 +1,77 @@
-name: Main Branch Cost & AI Gates
+name: Terraform Cost & Gemini AI Review
 
 on:
   pull_request_target:
-    branches: [ main ]
-    paths: [ '**/*.tf' ]
+    paths:
+      - "**/*.tf"
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  # --------------------------------------------------
-  # 1️⃣ Infracost job
-  # --------------------------------------------------
-  infracost-cost-gate:
+  cost-and-ai-review:
+    name: infracost-and-gemini
     runs-on: ubuntu-latest
 
-    env:
-      TF_IN_AUTOMATION: true
-      TF_INPUT: false
-
     steps:
+      # --------------------------------------------------
+      # Checkout PR code safely (required for pull_request_target)
+      # --------------------------------------------------
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
+      # --------------------------------------------------
+      # Terraform setup + plan
+      # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform init
+      - name: Terraform Init
         run: terraform init -input=false
 
-      - name: Terraform plan
+      - name: Terraform Plan
         run: terraform plan -out=tfplan.binary
 
-      - name: Terraform plan to JSON
+      - name: Export Terraform plan to JSON
         run: terraform show -json tfplan.binary > plan.json
 
+      # --------------------------------------------------
+      # Infracost (REAL COST from plan.json)
+      # --------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost
+      - name: Run Infracost breakdown
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
+      - name: Generate Infracost PR comment
+        run: |
+          infracost output \
+            --path infracost.json \
+            --format github-comment \
+            --out-file infracost.md
+
       - name: Post Infracost comment
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          body=$(infracost output --path infracost.json --format github-comment)
-          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
-            -f body="$body"
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file infracost.md
 
-      - name: Upload Infracost JSON
-        uses: actions/upload-artifact@v4
-        with:
-          name: infracost-json
-          path: infracost.json
-
-  # --------------------------------------------------
-  # 2️⃣ Gemini AI job (FIXED)
-  # --------------------------------------------------
-  gemini-ai-gate:
-    runs-on: ubuntu-latest
-    needs: infracost-cost-gate
-
-    steps:
-      # 🔴 THIS WAS MISSING BEFORE — THIS IS THE ROOT CAUSE
-      - name: Checkout PR code (REQUIRED)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Download Infracost artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: infracost-json
-
-      - name: Build Gemini prompt
+      # --------------------------------------------------
+      # Gemini AI cost & architecture review
+      # --------------------------------------------------
+      - name: Build Gemini request
         run: |
           jq -n \
             --argjson cost "$(cat infracost.json)" \
@@ -93,33 +81,34 @@ jobs:
                 parts: [{
                   text: (
                     "You are a GCP Cloud Architect and FinOps expert.\n\n" +
-                    "Analyze this Terraform/Infracost cost report and provide:\n\n" +
+                    "Analyze the following Infracost report and provide:\n\n" +
                     "1. Total monthly cost\n" +
-                    "2. Cost-driving resources\n" +
+                    "2. Cost per resource\n" +
                     "3. GCP machine types used\n" +
-                    "4. Cheaper or better alternatives (e2, n2, custom)\n" +
-                    "5. Disk and storage optimization\n" +
-                    "6. Any risks before merge\n\n" +
+                    "4. Cheaper or more efficient alternatives\n" +
+                    "5. Disk and storage optimization suggestions\n" +
+                    "6. Any risks or concerns before deployment\n\n" +
+                    "Return concise markdown.\n\n" +
                     "INFRACOST JSON:\n" + ($cost | tostring)
                   )
                 }]
               }]
-            }' > gemini.json
+            }' > gemini_request.json
 
       - name: Call Gemini API
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           curl -s \
-            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=$GEMINI_API_KEY" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini.json \
+            -d @gemini_request.json \
             | jq -r '.candidates[0].content.parts[0].text' > gemini.md
 
-      - name: Post Gemini AI comment
+      - name: Post Gemini AI review
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
-            -f body="$(printf '## 🤖 Gemini AI – Cost & Architecture Review\n\n%s' "$(cat gemini.md)")"
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "$(printf '## 🤖 Gemini AI Cost & Architecture Review\n\n%s' "$(cat gemini.md)")"
 
