@@ -1,8 +1,0 @@
-{
-  "contents": [{
-    "role": "user",
-    "parts": [{
-      "text": "Analyze this GCP Pub/Sub Terraform cost and provide optimization advice."
-    }]
-  }]
-}

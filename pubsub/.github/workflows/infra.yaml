@@ -1,0 +1,127 @@
+name: Terraform Cost & Gemini AI FinOps Gate
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "**/*.tf"
+      - ".github/workflows/infra.yaml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  finops-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------
+      # Checkout
+      # ----------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ----------------------------
+      # Terraform
+      # ----------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan.binary
+
+      - name: Terraform Plan JSON
+        run: terraform show -json tfplan.binary > plan.json
+
+      # ----------------------------
+      # Infracost
+      # ----------------------------
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Infracost
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
+
+      # ----------------------------
+      # Cost Classification (FIXED vs USAGE)
+      # ----------------------------
+      - name: Classify Costs
+        run: |
+          jq '
+          {
+            fixed_cost_resources: [
+              .projects[].breakdown.resources[]
+              | select(.costComponents != null and (.costComponents | length > 0))
+              | { name, resourceType, monthlyCost }
+            ],
+            usage_based_resources: [
+              .projects[].breakdown.resources[]
+              | select(.costComponents == null or (.costComponents | length == 0))
+              | { name, resourceType }
+            ]
+          }
+          ' infracost.json > cost_model.json
+
+      # ----------------------------
+      # Gemini Prompt (STRICT)
+      # ----------------------------
+      - name: Build Gemini Request
+        run: |
+          FIXED=$(jq -c '.fixed_cost_resources' cost_model.json)
+          USAGE=$(jq -c '.usage_based_resources' cost_model.json)
+
+          jq -n --arg fixed "$FIXED" --arg usage "$USAGE" '
+          {
+            contents: [{
+              role: "user",
+              parts: [{
+                text:
+"MANDATORY RULES:\n\
+1. Start EXACTLY with: 🤖 Gemini AI FinOps Analysis\n\
+2. Do NOT invent prices.\n\
+3. Usage-based resources MUST say:\n\
+   Usage-based – cost depends on traffic, retention, and delivery volume.\n\
+4. Analyze ONLY the resources provided.\n\
+5. If no fixed-cost resources exist, say:\n\
+   No fixed monthly costs detected.\n\n\
+FIXED COST RESOURCES:\n" + $fixed + "\n\n\
+USAGE BASED RESOURCES:\n" + $usage + "\n\n\
+Provide a concise FinOps analysis and GCP optimization guidance."
+              }]
+            }]
+          }
+          ' > gemini_request.json
+
+      # ----------------------------
+      # Gemini AI
+      # ----------------------------
+      - name: Run Gemini AI
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text' > gemini.md
+
+      # ----------------------------
+      # PR Comment
+      # ----------------------------
+      - name: Post FinOps Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file gemini.md
+
