@@ -1,4 +1,4 @@
-name: Main Branch Cost & AI Gates
+name: Cost & AI Gate (Infracost + Gemini)
 
 on:
   pull_request_target:
@@ -12,29 +12,37 @@ permissions:
   pull-requests: write
 
 jobs:
-  # --------------------------------------------------
-  # 1️⃣ Infracost Gate (BLOCKING)
-  # --------------------------------------------------
-  infracost:
-    name: infracost-cost-gate
+  cost-ai-gate:
+    name: cost-ai-gate
     runs-on: ubuntu-latest
 
     steps:
-      # Safe checkout of PR code
-      - name: Checkout PR code safely
+      # --------------------------------------------------
+      # Checkout PR code safely
+      # --------------------------------------------------
+      - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
+      # --------------------------------------------------
+      # Terraform setup
+      # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # --------------------------------------------------
+      # Infracost setup (USES REPO SECRET)
+      # --------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
+      # --------------------------------------------------
+      # Run Infracost
+      # --------------------------------------------------
       - name: Run Infracost breakdown
         run: |
           infracost breakdown \
@@ -56,39 +64,12 @@ jobs:
           gh pr comment ${{ github.event.pull_request.number }} \
             --body-file infracost.md
 
-      # OPTIONAL: Fail if monthly cost > threshold
-      # Uncomment to enforce cost ceiling
-      #
-      # - name: Enforce cost threshold
-      #   run: |
-      #     COST=$(jq '.totalMonthlyCost' infracost.json)
-      #     echo "Monthly cost: $COST"
-      #     if (( $(echo "$COST > 500" | bc -l) )); then
-      #       echo "❌ Cost exceeds threshold"
-      #       exit 1
-      #     fi
-
-      - name: Upload Infracost artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: infracost-json
-          path: infracost.json
-
-  # --------------------------------------------------
-  # 2️⃣ Gemini AI Gate (BLOCKING)
-  # --------------------------------------------------
-  gemini:
-    name: gemini-ai-gate
-    runs-on: ubuntu-latest
-    needs: infracost
-
-    steps:
-      - name: Download Infracost artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: infracost-json
-
-      - name: Build Gemini prompt
+      # --------------------------------------------------
+      # Gemini AI analysis (USES REPO SECRET)
+      # --------------------------------------------------
+      - name: Gemini AI cost review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           jq -n \
             --argjson cost "$(cat infracost.json)" \
@@ -98,12 +79,12 @@ jobs:
                 parts: [{
                   text: (
                     "You are a Principal Cloud Architect and FinOps lead.\n\n" +
-                    "Analyze this Terraform cost report and provide:\n" +
+                    "Review the Terraform cost report and provide:\n" +
                     "1. Monthly cost summary\n" +
                     "2. Key cost drivers\n" +
                     "3. Optimization recommendations\n" +
                     "4. Architecture or scaling risks\n" +
-                    "5. Anything that should BLOCK production merge\n\n" +
+                    "5. Any concerns that should block merging\n\n" +
                     "Return concise markdown.\n\n" +
                     "COST DATA:\n" + ($cost | tostring)
                   )
@@ -111,20 +92,16 @@ jobs:
               }]
             }' > gemini_payload.json
 
-      - name: Call Gemini API
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
           curl -s \
             "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @gemini_payload.json \
             | jq -r '.candidates[0].content.parts[0].text' > gemini.md
 
-      - name: Post Gemini AI recommendations
+      - name: Post Gemini AI review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$(printf '## 🤖 Gemini AI – Main Branch Gate\n\n%s' "$(cat gemini.md)")"
+            --body "$(printf '## 🤖 Gemini AI Review\n\n%s' "$(cat gemini.md)")"
 
