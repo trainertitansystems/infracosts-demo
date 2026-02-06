@@ -10,23 +10,18 @@ permissions:
   pull-requests: write
 
 jobs:
-  cost-and-ai-review:
-    name: infracost-and-gemini
+  infracost-and-gemini:
     runs-on: ubuntu-latest
 
     steps:
-      # --------------------------------------------------
-      # Checkout PR code safely (required for pull_request_target)
-      # --------------------------------------------------
+      # Checkout PR code safely
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      # --------------------------------------------------
-      # Terraform setup + plan
-      # --------------------------------------------------
+      # Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -39,22 +34,20 @@ jobs:
       - name: Export Terraform plan to JSON
         run: terraform show -json tfplan.binary > plan.json
 
-      # --------------------------------------------------
-      # Infracost (REAL COST from plan.json)
-      # --------------------------------------------------
+      # Infracost
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost breakdown
+      - name: Run Infracost
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-      - name: Generate Infracost PR comment
+      - name: Infracost PR Comment
         run: |
           infracost output \
             --path infracost.json \
@@ -68,10 +61,8 @@ jobs:
           gh pr comment ${{ github.event.pull_request.number }} \
             --body-file infracost.md
 
-      # --------------------------------------------------
-      # Gemini AI cost & architecture review
-      # --------------------------------------------------
-      - name: Build Gemini request
+      # Gemini AI
+      - name: Build Gemini prompt
         run: |
           jq -n \
             --argjson cost "$(cat infracost.json)" \
@@ -80,16 +71,15 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "You are a GCP Cloud Architect and FinOps expert.\n\n" +
-                    "Analyze the following Infracost report and provide:\n\n" +
-                    "1. Total monthly cost\n" +
-                    "2. Cost per resource\n" +
-                    "3. GCP machine types used\n" +
-                    "4. Cheaper or more efficient alternatives\n" +
-                    "5. Disk and storage optimization suggestions\n" +
-                    "6. Any risks or concerns before deployment\n\n" +
+                    "You are a GCP FinOps and Cloud Architect.\n\n" +
+                    "Analyze this Terraform cost report and provide:\n" +
+                    "• Monthly cost summary\n" +
+                    "• Cost drivers\n" +
+                    "• Cheaper GCP machine alternatives\n" +
+                    "• Disk and storage optimizations\n" +
+                    "• Risks before deployment\n\n" +
                     "Return concise markdown.\n\n" +
-                    "INFRACOST JSON:\n" + ($cost | tostring)
+                    "COST DATA:\n" + ($cost | tostring)
                   )
                 }]
               }]
@@ -111,4 +101,3 @@ jobs:
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
             --body "$(printf '## 🤖 Gemini AI Cost & Architecture Review\n\n%s' "$(cat gemini.md)")"
-
