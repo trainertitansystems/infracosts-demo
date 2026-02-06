@@ -2,10 +2,9 @@ name: Main Branch Cost & AI Gates
 
 on:
   pull_request_target:
-    branches:
-      - main
+    branches: [ main ]
     paths:
-      - '**/*.tf'
+      - "**/*.tf"
 
 permissions:
   contents: read
@@ -20,25 +19,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Safe checkout of PR code
       - name: Checkout PR code safely
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan.binary
+
+      - name: Export Terraform plan to JSON
+        run: terraform show -json tfplan.binary > plan.json
 
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost breakdown
+      - name: Run Infracost (REAL cost)
         run: |
           infracost breakdown \
-            --path . \
+            --path plan.json \
             --format json \
             --out-file infracost.json
 
@@ -46,27 +52,14 @@ jobs:
         run: |
           infracost output \
             --path infracost.json \
-            --format github-comment \
-            --out-file infracost.md
+            --format github-comment > infracost.md
 
       - name: Post Infracost comment
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body-file infracost.md
-
-      # OPTIONAL: Fail if monthly cost > threshold
-      # Uncomment to enforce cost ceiling
-      #
-      # - name: Enforce cost threshold
-      #   run: |
-      #     COST=$(jq '.totalMonthlyCost' infracost.json)
-      #     echo "Monthly cost: $COST"
-      #     if (( $(echo "$COST > 500" | bc -l) )); then
-      #       echo "❌ Cost exceeds threshold"
-      #       exit 1
-      #     fi
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="$(cat infracost.md)"
 
       - name: Upload Infracost artifact
         uses: actions/upload-artifact@v4
@@ -97,19 +90,18 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "You are a Principal Cloud Architect and FinOps lead.\n\n" +
+                    "You are a GCP Cloud Architect and FinOps expert.\n\n" +
                     "Analyze this Terraform cost report and provide:\n" +
                     "1. Monthly cost summary\n" +
-                    "2. Key cost drivers\n" +
-                    "3. Optimization recommendations\n" +
-                    "4. Architecture or scaling risks\n" +
-                    "5. Anything that should BLOCK production merge\n\n" +
-                    "Return concise markdown.\n\n" +
+                    "2. GCP machine types used\n" +
+                    "3. Cheaper machine alternatives\n" +
+                    "4. Disk and storage optimization\n" +
+                    "5. Any production risks\n\n" +
                     "COST DATA:\n" + ($cost | tostring)
                   )
                 }]
               }]
-            }' > gemini_payload.json
+            }' > gemini.json
 
       - name: Call Gemini API
         env:
@@ -118,13 +110,12 @@ jobs:
           curl -s \
             "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini_payload.json \
+            -d @gemini.json \
             | jq -r '.candidates[0].content.parts[0].text' > gemini.md
 
       - name: Post Gemini AI recommendations
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$(printf '## 🤖 Gemini AI – Main Branch Gate\n\n%s' "$(cat gemini.md)")"
-
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="$(printf '## 🤖 Gemini AI – Main Branch Gate\n\n%s' "$(cat gemini.md)")"
