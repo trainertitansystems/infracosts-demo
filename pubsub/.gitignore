@@ -1,0 +1,12 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+tfplan.binary
+plan.json
+infracost.json
+cost_classification.json
+gemini_request.json
+gemini_response.json
+
