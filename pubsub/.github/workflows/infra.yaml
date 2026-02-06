@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [ main ]
     paths:
-      - "**/*.tf"
+      - "pubsub/**/*.tf"
       - ".github/workflows/infra.yaml"
 
 permissions:
@@ -15,12 +15,40 @@ jobs:
   finops-gate:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: pubsub
+
     steps:
       # ----------------------------
       # Checkout
       # ----------------------------
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # ----------------------------
+      # Sanity check (defensive)
+      # ----------------------------
+      - name: Verify Terraform files exist
+        run: |
+          ls *.tf >/dev/null 2>&1 || {
+            echo "❌ No Terraform files found in pubsub/"
+            exit 1
+          }
+
+      # ----------------------------
+      # Cleanup (ROBUSTNESS)
+      # ----------------------------
+      - name: Clean previous Terraform & cost artifacts
+        run: |
+          rm -rf \
+            .terraform \
+            tfplan.binary \
+            plan.json \
+            infracost.json \
+            cost_model.json \
+            gemini_request.json \
+            gemini.md || true
 
       # ----------------------------
       # Terraform
@@ -53,20 +81,21 @@ jobs:
             --out-file infracost.json
 
       # ----------------------------
-      # Cost Classification (FIXED vs USAGE)
+      # Cost Classification
       # ----------------------------
-      - name: Classify Costs
+      - name: Classify Fixed vs Usage-Based Costs
         run: |
           jq '
           {
             fixed_cost_resources: [
               .projects[].breakdown.resources[]
               | select(.costComponents != null and (.costComponents | length > 0))
+              | select(any(.costComponents[]; .usageBased == false))
               | { name, resourceType, monthlyCost }
             ],
             usage_based_resources: [
               .projects[].breakdown.resources[]
-              | select(.costComponents == null or (.costComponents | length == 0))
+              | select(all(.costComponents[]; .usageBased == true))
               | { name, resourceType }
             ]
           }
@@ -86,17 +115,14 @@ jobs:
               role: "user",
               parts: [{
                 text:
-"MANDATORY RULES:\n\
-1. Start EXACTLY with: 🤖 Gemini AI FinOps Analysis\n\
-2. Do NOT invent prices.\n\
-3. Usage-based resources MUST say:\n\
-   Usage-based – cost depends on traffic, retention, and delivery volume.\n\
-4. Analyze ONLY the resources provided.\n\
-5. If no fixed-cost resources exist, say:\n\
-   No fixed monthly costs detected.\n\n\
+"🤖 Gemini AI FinOps Analysis\n\n\
+RULES:\n\
+- Do NOT invent prices\n\
+- Usage-based resources MUST be labeled usage-based\n\
+- If no fixed-cost resources exist, explicitly say so\n\n\
 FIXED COST RESOURCES:\n" + $fixed + "\n\n\
 USAGE BASED RESOURCES:\n" + $usage + "\n\n\
-Provide a concise FinOps analysis and GCP optimization guidance."
+Provide GCP FinOps and architectural optimization guidance."
               }]
             }]
           }
