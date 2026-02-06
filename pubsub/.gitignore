@@ -1,0 +1,19 @@
+# Terraform runtime
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tfplan.binary
+plan.json
+
+# Infracost
+infracost.json
+cost_model.json
+
+# Gemini
+gemini_*.json
+gemini.md
+
+# Variables
+terraform.tfvars
+
