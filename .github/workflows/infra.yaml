@@ -8,12 +8,12 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  id-token: write   # REQUIRED for Workload Identity Federation
+  id-token: write   # Required for GCP Workload Identity Federation
 
 jobs:
   infracost-and-gemini:
-    runs-on: ubuntu-latest
     name: infracost-and-gemini
+    runs-on: ubuntu-latest
 
     steps:
       # --------------------------------------------------
@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
 
       # --------------------------------------------------
-      # Authenticate to Google Cloud (WIF)
+      # Authenticate to Google Cloud (Workload Identity)
       # --------------------------------------------------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -35,7 +35,7 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
 
       # --------------------------------------------------
-      # Terraform plan
+      # Terraform Plan
       # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -50,7 +50,7 @@ jobs:
         run: terraform show -json tfplan.binary > plan.json
 
       # --------------------------------------------------
-      # Infracost (REAL COST from plan.json)
+      # Infracost (real costs from plan.json)
       # --------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
@@ -79,7 +79,7 @@ jobs:
             --body-file infracost.md
 
       # --------------------------------------------------
-      # Gemini AI cost & architecture review
+      # Gemini AI Review
       # --------------------------------------------------
       - name: Build Gemini request
         run: |
@@ -90,16 +90,15 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "You are a GCP Cloud Architect and FinOps expert.\n\n" +
-                    "Analyze the following Infracost report and provide:\n\n" +
-                    "1. Total monthly cost\n" +
-                    "2. Cost per resource\n" +
-                    "3. GCP machine types used\n" +
-                    "4. Cheaper or more efficient alternatives\n" +
-                    "5. Disk and storage optimization suggestions\n" +
-                    "6. Any risks or concerns before deployment\n\n" +
+                    "You are a GCP FinOps and Cloud Architect.\n\n" +
+                    "Review this Terraform cost estimate and provide:\n" +
+                    "• Monthly cost summary\n" +
+                    "• Cost drivers\n" +
+                    "• Cheaper GCP machine alternatives\n" +
+                    "• Disk/storage optimizations\n" +
+                    "• Risks before deployment\n\n" +
                     "Return concise markdown.\n\n" +
-                    "INFRACOST JSON:\n" + ($cost | tostring)
+                    "INFRACOST DATA:\n" + ($cost | tostring)
                   )
                 }]
               }]
