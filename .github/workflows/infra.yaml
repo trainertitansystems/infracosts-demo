@@ -1,4 +1,4 @@
-name: Cost & AI Gate (Terraform + Infracost + Gemini)
+name: Terraform Cost & AI Gate
 
 on:
   pull_request_target:
@@ -21,7 +21,7 @@ jobs:
 
     steps:
       # --------------------------------------------------
-      # Checkout PR code (this fixes the git error)
+      # Checkout PR code (REQUIRED for gh + terraform)
       # --------------------------------------------------
       - name: Checkout PR code
         uses: actions/checkout@v4
@@ -42,14 +42,14 @@ jobs:
         run: terraform plan -out=tfplan.binary
 
       # --------------------------------------------------
-      # Infracost
+      # Infracost (plan-based, real GCP costs)
       # --------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost (plan-based)
+      - name: Run Infracost
         run: |
           infracost breakdown \
             --terraform-plan-file=tfplan.binary \
@@ -66,9 +66,9 @@ jobs:
             | gh pr comment ${{ github.event.pull_request.number }} --body-file -
 
       # --------------------------------------------------
-      # Gemini AI (GCP cost + machine type advice)
+      # Gemini AI (cost + GCP machine recommendations)
       # --------------------------------------------------
-      - name: Gemini AI cost review
+      - name: Gemini AI cost optimization
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -80,12 +80,12 @@ jobs:
                 parts: [{
                   text: (
                     "You are a GCP Cloud Architect and FinOps expert.\n\n" +
-                    "Analyze this Terraform cost report and provide:\n" +
+                    "Analyze this Terraform/Infracost report and provide:\n\n" +
                     "1. Total monthly cost\n" +
                     "2. Top cost-driving resources\n" +
-                    "3. GCP machine types used\n" +
+                    "3. GCP Compute Engine machine types used\n" +
                     "4. Cheaper or more efficient alternatives (e2, n2, c2, custom)\n" +
-                    "5. Rightsizing and scaling advice\n" +
+                    "5. Rightsizing, autoscaling, and CUD advice\n" +
                     "6. Any cost or architecture risks before merge\n\n" +
                     "Return concise markdown.\n\n" +
                     "INFRACOST JSON:\n" + ($cost | tostring)
