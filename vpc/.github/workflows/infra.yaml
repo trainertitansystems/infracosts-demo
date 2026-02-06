@@ -1,0 +1,140 @@
+name: Terraform Cost & Gemini AI FinOps Gate
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "**/*.tf"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  finops-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # Detect changed Terraform dir
+      # -----------------------------
+      - name: Detect Terraform directory
+        id: tfdir
+        run: |
+          DIR=$(git diff --name-only origin/main...HEAD \
+            | grep '\.tf$' \
+            | head -n 1 \
+            | xargs dirname)
+
+          echo "Terraform directory: $DIR"
+          echo "dir=$DIR" >> $GITHUB_OUTPUT
+
+      # -----------------------------
+      # Hard cleanup (critical)
+      # -----------------------------
+      - name: Clean previous artifacts
+        run: |
+          rm -rf .terraform
+          rm -f tfplan.binary plan.json infracost.json
+
+      # -----------------------------
+      # Terraform
+      # -----------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform plan -out=tfplan.binary
+
+      - name: Export Plan JSON
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform show -json tfplan.binary > plan.json
+
+      # -----------------------------
+      # Infracost
+      # -----------------------------
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Infracost
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
+
+      # -----------------------------
+      # Classify usage vs fixed
+      # -----------------------------
+      - name: Classify Costs
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: |
+          jq '
+          {
+            fixed: [
+              .projects[].breakdown.resources[]
+              | select(.monthlyCost != null and .monthlyCost != "0")
+              | { name, resourceType, monthlyCost }
+            ],
+            usage: [
+              .projects[].breakdown.resources[]
+              | select(.monthlyCost == null or .monthlyCost == "0")
+              | { name, resourceType }
+            ]
+          }' infracost.json > cost.json
+
+      # -----------------------------
+      # Gemini prompt
+      # -----------------------------
+      - name: Build Gemini Request
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: |
+          jq -n --argjson data "$(cat cost.json)" '
+          {
+            contents: [{
+              role: "user",
+              parts: [{
+                text:
+                "🤖 Gemini AI FinOps Analysis\n\n" +
+                "You MUST analyze only the resources below.\n" +
+                "If a resource is usage-based, say exactly:\n" +
+                "\"Usage-based – cost depends on traffic and consumption.\"\n\n" +
+                "Resources:\n" + ($data | tostring)
+              }]
+            }]
+          }' > gemini.json
+
+      # -----------------------------
+      # Gemini API
+      # -----------------------------
+      - name: Run Gemini
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @gemini.json > gemini_response.json
+
+      # -----------------------------
+      # PR Comment
+      # -----------------------------
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "$(jq -r '.candidates[0].content.parts[0].text' ${{ steps.tfdir.outputs.dir }}/gemini_response.json)"
+
