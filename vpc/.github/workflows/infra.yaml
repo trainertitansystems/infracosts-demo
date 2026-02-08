@@ -1,4 +1,4 @@
-name: Terraform PR-Only Cost Gate
+name: Terraform PR FinOps Gate (Single Root, PR-only)
 
 on:
   pull_request:
@@ -19,55 +19,57 @@ jobs:
 
     steps:
       # =====================================================
-      # 1️⃣ Checkout PR HEAD ONLY (temporary branch)
+      # Checkout PR HEAD ONLY
       # =====================================================
-      - name: Checkout PR temporary branch
+      - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       # =====================================================
-      # 2️⃣ Detect Terraform directory FROM PR CONTENT ONLY
+      # HARD CLEAN — NO REUSE POSSIBLE
       # =====================================================
-      - name: Detect Terraform root (PR-only)
-        id: tfdir
+      - name: Hard clean workspace
+        run: |
+          rm -rf .terraform **/.terraform
+          rm -f **/*.tfplan **/*.binary
+          rm -f **/plan.json **/infracost*.json
+
+      # =====================================================
+      # Detect Terraform roots (PR-only)
+      # =====================================================
+      - name: Detect Terraform roots
+        id: tfroots
         shell: bash
         run: |
           set -euo pipefail
 
-          DIR=$(git ls-files '*.tf' \
+          ROOTS=$(git ls-files '*.tf' \
             | xargs -n1 dirname \
-            | sort -u \
-            | head -n1)
+            | sort -u)
 
-          if [ -z "$DIR" ]; then
-            echo "❌ No Terraform files in PR branch"
-            exit 1
-          fi
+          COUNT=$(echo "$ROOTS" | wc -l | tr -d ' ')
 
-          if [ "$DIR" = "." ]; then
+          echo "Detected Terraform roots:"
+          echo "$ROOTS"
+
+          # Block repo root
+          if echo "$ROOTS" | grep -qx "."; then
             echo "❌ Terraform at repo root is forbidden"
             exit 1
           fi
 
-          echo "Terraform dir: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          # Enforce single root
+          if [ "$COUNT" -ne 1 ]; then
+            echo "❌ Exactly ONE Terraform root per PR is allowed"
+            exit 1
+          fi
+
+          echo "dir=$ROOTS" >> "$GITHUB_OUTPUT"
 
       # =====================================================
-      # 3️⃣ HARD CLEAN — DELETE EVERYTHING
-      # =====================================================
-      - name: Hard clean workspace (no reuse possible)
-        run: |
-          rm -rf .terraform **/.terraform
-          rm -f **/*.tfplan **/*.binary
-          rm -f **/plan.json
-          rm -f **/infracost*.json
-          rm -f **/cost*.json
-          rm -f **/*.lock.hcl
-
-      # =====================================================
-      # 4️⃣ Setup Terraform & Infracost
+      # Setup Terraform & Infracost
       # =====================================================
       - uses: hashicorp/setup-terraform@v3
 
@@ -76,25 +78,25 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       # =====================================================
-      # 5️⃣ Terraform PLAN — PR CODE ONLY
+      # Terraform (PR directory ONLY)
       # =====================================================
-      - name: Terraform Init (PR only)
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+      - name: Terraform Init
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: terraform init -input=false -lock=false
 
-      - name: Terraform Plan (PR only)
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+      - name: Terraform Plan
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: terraform plan -out=pr.tfplan -lock=false
 
-      - name: Export PR plan JSON
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+      - name: Export plan JSON
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: terraform show -json pr.tfplan > plan.json
 
       # =====================================================
-      # 6️⃣ Infracost — PR PLAN ONLY
+      # Infracost (PLAN ONLY)
       # =====================================================
-      - name: Run Infracost (PR only)
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+      - name: Run Infracost
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
           infracost breakdown \
             --path plan.json \
@@ -102,10 +104,10 @@ jobs:
             --out-file infracost.json
 
       # =====================================================
-      # 7️⃣ HARD COST GATE (FAILS PR)
+      # HARD COST GATE
       # =====================================================
       - name: Enforce monthly cost limit
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
           set -euo pipefail
 
@@ -122,13 +124,14 @@ jobs:
           echo "✅ Cost within allowed limit"
 
       # =====================================================
-      # 8️⃣ PR COMMENT (OPTIONAL, HUMAN READABLE)
+      # PR COMMENT (PR-ONLY, NO BASELINE)
       # =====================================================
-      - name: Comment cost on PR
+      - name: Comment PR cost
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body "**Terraform PR Cost Analysis**  
-Estimated monthly cost: $TOTAL USD"
+            --body "**Terraform PR Cost (PR branch only)**  
+Directory: \`${{ steps.tfroots.outputs.dir }}\`  
+Estimated monthly cost: **$TOTAL USD**"
 
