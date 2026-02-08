@@ -1,4 +1,4 @@
-name: Terraform Cost & Gemini AI FinOps Gate
+name: Terraform PR-Only Cost Gate
 
 on:
   pull_request:
@@ -10,36 +10,39 @@ permissions:
   contents: read
   pull-requests: write
 
+env:
+  MAX_MONTHLY_COST_USD: "50"
+
 jobs:
   finops-gate:
     runs-on: ubuntu-latest
 
     steps:
       # =====================================================
-      # Checkout PR code (THIS is the key)
+      # 1️⃣ Checkout PR HEAD ONLY (temporary branch)
       # =====================================================
-      - name: Checkout PR branch
+      - name: Checkout PR temporary branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
 
       # =====================================================
-      # Detect Terraform directory from PR ONLY
+      # 2️⃣ Detect Terraform directory FROM PR CONTENT ONLY
       # =====================================================
-      - name: Detect Terraform root
+      - name: Detect Terraform root (PR-only)
         id: tfdir
         shell: bash
         run: |
           set -euo pipefail
 
-          DIR=$(git diff --name-only origin/main...HEAD \
-            | grep '\.tf$' \
+          DIR=$(git ls-files '*.tf' \
             | xargs -n1 dirname \
             | sort -u \
             | head -n1)
 
           if [ -z "$DIR" ]; then
-            echo "❌ No Terraform changes in PR"
+            echo "❌ No Terraform files in PR branch"
             exit 1
           fi
 
@@ -52,41 +55,45 @@ jobs:
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       # =====================================================
-      # HARD CLEAN — PR workspace only
+      # 3️⃣ HARD CLEAN — DELETE EVERYTHING
       # =====================================================
-      - name: Clean workspace
+      - name: Hard clean workspace (no reuse possible)
         run: |
           rm -rf .terraform **/.terraform
-          rm -f **/tfplan.binary **/plan.json **/infracost.json
-          rm -f **/cost.json **/gemini.json **/gemini_response.txt
+          rm -f **/*.tfplan **/*.binary
+          rm -f **/plan.json
+          rm -f **/infracost*.json
+          rm -f **/cost*.json
+          rm -f **/*.lock.hcl
 
       # =====================================================
-      # Terraform (PR directory only)
+      # 4️⃣ Setup Terraform & Infracost
       # =====================================================
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform Init
-        working-directory: ${{ steps.tfdir.outputs.dir }}
-        run: terraform init -input=false -lock=false
-
-      - name: Terraform Plan
-        working-directory: ${{ steps.tfdir.outputs.dir }}
-        run: terraform plan -out=tfplan.binary -lock=false
-
-      - name: Export Plan JSON
-        working-directory: ${{ steps.tfdir.outputs.dir }}
-        run: terraform show -json tfplan.binary > plan.json
-
-      # =====================================================
-      # Infracost (PR-only plan)
-      # =====================================================
-      - name: Setup Infracost
-        uses: infracost/actions/setup@v3
+      - uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost
+      # =====================================================
+      # 5️⃣ Terraform PLAN — PR CODE ONLY
+      # =====================================================
+      - name: Terraform Init (PR only)
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform init -input=false -lock=false
+
+      - name: Terraform Plan (PR only)
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform plan -out=pr.tfplan -lock=false
+
+      - name: Export PR plan JSON
+        working-directory: ${{ steps.tfdir.outputs.dir }}
+        run: terraform show -json pr.tfplan > plan.json
+
+      # =====================================================
+      # 6️⃣ Infracost — PR PLAN ONLY
+      # =====================================================
+      - name: Run Infracost (PR only)
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           infracost breakdown \
@@ -95,71 +102,33 @@ jobs:
             --out-file infracost.json
 
       # =====================================================
-      # Cost classification (NO guessing)
+      # 7️⃣ HARD COST GATE (FAILS PR)
       # =====================================================
-      - name: Classify costs
+      - name: Enforce monthly cost limit
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
-          jq '
-          {
-            fixed_cost_resources: [
-              .projects[].breakdown.resources[]
-              | select(any(.costComponents[]?; .usageBased == false))
-              | { name, resourceType, monthlyCost }
-            ],
-            usage_based_resources: [
-              .projects[].breakdown.resources[]
-              | select(all(.costComponents[]?; .usageBased == true))
-              | { name, resourceType }
-            ]
-          }
-          ' infracost.json > cost.json
+          set -euo pipefail
+
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
+
+          echo "PR monthly cost: $TOTAL USD"
+          echo "Limit: $MAX_MONTHLY_COST_USD USD"
+
+          if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
+            echo "❌ Cost exceeds allowed limit"
+            exit 1
+          fi
+
+          echo "✅ Cost within allowed limit"
 
       # =====================================================
-      # Gemini (PR-only input)
+      # 8️⃣ PR COMMENT (OPTIONAL, HUMAN READABLE)
       # =====================================================
-      - name: Build Gemini request
-        working-directory: ${{ steps.tfdir.outputs.dir }}
-        run: |
-          jq -n --argjson data "$(cat cost.json)" '
-          {
-            contents: [{
-              role: "user",
-              parts: [{
-                text:
-"🤖 Gemini AI FinOps Analysis\n\n"
-"RULES:\n"
-"1. Analyze ONLY the resources below.\n"
-"2. Do NOT mention any resource not listed.\n"
-"3. Usage-based resources MUST be described as:\n"
-"   \"Usage-based – cost depends on consumption.\"\n"
-"4. If no fixed costs exist, say:\n"
-"   \"No fixed monthly costs detected.\"\n\n"
-"RESOURCES:\n" + ($data | tostring)
-              }]
-            }]
-          }
-          ' > gemini.json
-
-      - name: Run Gemini
-        working-directory: ${{ steps.tfdir.outputs.dir }}
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          curl -s \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d @gemini.json \
-            | jq -r '.candidates[0].content.parts[0].text' \
-            > gemini_response.txt
-
-      # =====================================================
-      # PR Comment
-      # =====================================================
-      - name: Comment on PR
+      - name: Comment cost on PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body-file "${{ steps.tfdir.outputs.dir }}/gemini_response.txt"
+            --body "**Terraform PR Cost Analysis**  
+Estimated monthly cost: $TOTAL USD"
 
