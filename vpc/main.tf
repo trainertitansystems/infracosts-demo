@@ -1,5 +1,4 @@
 # Captains are Indians and Australians
-#whow is the cajlfjlahfl
 
 terraform {
   required_providers {
