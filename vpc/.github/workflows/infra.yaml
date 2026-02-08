@@ -15,30 +15,52 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # -----------------------------
+      # Checkout (fresh repo)
+      # -----------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # REQUIRED for git diff
 
       # -----------------------------
-      # Detect changed Terraform dir
+      # Detect Terraform root dir
       # -----------------------------
       - name: Detect Terraform directory
         id: tfdir
+        shell: bash
         run: |
+          set -e
+
           DIR=$(git diff --name-only origin/main...HEAD \
             | grep '\.tf$' \
             | head -n 1 \
             | xargs dirname)
 
+          if [ -z "$DIR" ]; then
+            echo "❌ No Terraform directory detected"
+            exit 1
+          fi
+
           echo "Terraform directory: $DIR"
-          echo "dir=$DIR" >> $GITHUB_OUTPUT
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       # -----------------------------
-      # Hard cleanup (critical)
+      # HARD CLEAN (no reuse possible)
       # -----------------------------
-      - name: Clean previous artifacts
+      - name: Hard cleanup (guarantee no stale data)
+        shell: bash
         run: |
-          rm -rf .terraform
-          rm -f tfplan.binary plan.json infracost.json
+          set -e
+          rm -rf \
+            .terraform \
+            **/.terraform \
+            **/tfplan.binary \
+            **/plan.json \
+            **/infracost.json \
+            **/cost.json \
+            **/gemini.json \
+            **/gemini_response.json
 
       # -----------------------------
       # Terraform
@@ -54,12 +76,12 @@ jobs:
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform plan -out=tfplan.binary
 
-      - name: Export Plan JSON
+      - name: Export Terraform Plan JSON
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform show -json tfplan.binary > plan.json
 
       # -----------------------------
-      # Infracost
+      # Infracost (fresh install)
       # -----------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
@@ -75,29 +97,30 @@ jobs:
             --out-file infracost.json
 
       # -----------------------------
-      # Classify usage vs fixed
+      # STRICT cost classification
       # -----------------------------
-      - name: Classify Costs
+      - name: Classify costs (fixed vs usage)
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           jq '
           {
-            fixed: [
+            fixed_cost_resources: [
               .projects[].breakdown.resources[]
-              | select(.monthlyCost != null and .monthlyCost != "0")
+              | select(any(.costComponents[]?; .usageBased == false))
               | { name, resourceType, monthlyCost }
             ],
-            usage: [
+            usage_based_resources: [
               .projects[].breakdown.resources[]
-              | select(.monthlyCost == null or .monthlyCost == "0")
+              | select(all(.costComponents[]?; .usageBased == true))
               | { name, resourceType }
             ]
-          }' infracost.json > cost.json
+          }
+          ' infracost.json > cost.json
 
       # -----------------------------
-      # Gemini prompt
+      # Gemini request (NON-HALLUCINATING)
       # -----------------------------
-      - name: Build Gemini Request
+      - name: Build Gemini request
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           jq -n --argjson data "$(cat cost.json)" '
@@ -106,19 +129,25 @@ jobs:
               role: "user",
               parts: [{
                 text:
-                "🤖 Gemini AI FinOps Analysis\n\n" +
-                "You MUST analyze only the resources below.\n" +
-                "If a resource is usage-based, say exactly:\n" +
-                "\"Usage-based – cost depends on traffic and consumption.\"\n\n" +
-                "Resources:\n" + ($data | tostring)
+"🤖 Gemini AI FinOps Analysis\n\n"
+"STRICT RULES:\n"
+"1. Analyze ONLY the resources listed below.\n"
+"2. Do NOT mention resources not listed.\n"
+"3. Usage-based resources MUST be described as:\n"
+"   \"Usage-based – cost depends on traffic, data transfer, or consumption.\"\n"
+"4. Do NOT infer historical pricing.\n"
+"5. If no fixed-cost resources exist, say exactly:\n"
+"   \"No fixed monthly costs detected.\"\n\n"
+"RESOURCES:\n" + ($data | tostring)
               }]
             }]
-          }' > gemini.json
+          }
+          ' > gemini.json
 
       # -----------------------------
-      # Gemini API
+      # Gemini API (no cache, no reuse)
       # -----------------------------
-      - name: Run Gemini
+      - name: Run Gemini AI
         working-directory: ${{ steps.tfdir.outputs.dir }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -126,15 +155,17 @@ jobs:
           curl -s \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini.json > gemini_response.json
+            -d @gemini.json \
+            | jq -r '.candidates[0].content.parts[0].text' \
+            > gemini_response.json
 
       # -----------------------------
-      # PR Comment
+      # PR comment (fresh every run)
       # -----------------------------
-      - name: Comment on PR
+      - name: Post FinOps comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$(jq -r '.candidates[0].content.parts[0].text' ${{ steps.tfdir.outputs.dir }}/gemini_response.json)"
+            --body-file "${{ steps.tfdir.outputs.dir }}/gemini_response.json"
 
