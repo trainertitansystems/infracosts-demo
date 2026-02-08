@@ -1,7 +1,7 @@
 name: Terraform Cost & Gemini AI FinOps Gate
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [ main ]
     paths:
       - "**/*.tf"
@@ -15,43 +15,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # -----------------------------
-      # Checkout (fresh repo)
-      # -----------------------------
-      - name: Checkout repository
+      # -------------------------------------------------
+      # 1. CHECKOUT *PR CODE* (CRITICAL FIX)
+      # -------------------------------------------------
+      - name: Checkout PR code (NOT main)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # REQUIRED for git diff
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      # -----------------------------
-      # Detect Terraform root dir
-      # -----------------------------
+      # -------------------------------------------------
+      # 2. Detect Terraform directory from PR diff
+      # -------------------------------------------------
       - name: Detect Terraform directory
         id: tfdir
         shell: bash
         run: |
           set -e
-
           DIR=$(git diff --name-only origin/main...HEAD \
             | grep '\.tf$' \
             | head -n 1 \
             | xargs dirname)
 
           if [ -z "$DIR" ]; then
-            echo "❌ No Terraform directory detected"
+            echo "❌ No Terraform directory detected in PR"
             exit 1
           fi
 
           echo "Terraform directory: $DIR"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-      # -----------------------------
-      # HARD CLEAN (no reuse possible)
-      # -----------------------------
-      - name: Hard cleanup (guarantee no stale data)
+      # -------------------------------------------------
+      # 3. HARD CLEAN (ABSOLUTE ISOLATION)
+      # -------------------------------------------------
+      - name: Hard cleanup (no stale artifacts)
         shell: bash
         run: |
-          set -e
           rm -rf \
             .terraform \
             **/.terraform \
@@ -62,9 +62,9 @@ jobs:
             **/gemini.json \
             **/gemini_response.json
 
-      # -----------------------------
-      # Terraform
-      # -----------------------------
+      # -------------------------------------------------
+      # 4. Terraform
+      # -------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -80,9 +80,9 @@ jobs:
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform show -json tfplan.binary > plan.json
 
-      # -----------------------------
-      # Infracost (fresh install)
-      # -----------------------------
+      # -------------------------------------------------
+      # 5. Infracost (fresh every run)
+      # -------------------------------------------------
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
@@ -96,10 +96,10 @@ jobs:
             --format json \
             --out-file infracost.json
 
-      # -----------------------------
-      # STRICT cost classification
-      # -----------------------------
-      - name: Classify costs (fixed vs usage)
+      # -------------------------------------------------
+      # 6. STRICT cost classification
+      # -------------------------------------------------
+      - name: Classify fixed vs usage-based costs
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           jq '
@@ -117,9 +117,9 @@ jobs:
           }
           ' infracost.json > cost.json
 
-      # -----------------------------
-      # Gemini request (NON-HALLUCINATING)
-      # -----------------------------
+      # -------------------------------------------------
+      # 7. Gemini prompt (NON-HALLUCINATING)
+      # -------------------------------------------------
       - name: Build Gemini request
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
@@ -130,13 +130,12 @@ jobs:
               parts: [{
                 text:
 "🤖 Gemini AI FinOps Analysis\n\n"
-"STRICT RULES:\n"
-"1. Analyze ONLY the resources listed below.\n"
-"2. Do NOT mention resources not listed.\n"
-"3. Usage-based resources MUST be described as:\n"
+"RULES:\n"
+"1. Analyze ONLY the resources below.\n"
+"2. DO NOT mention any other services.\n"
+"3. Usage-based resources MUST say:\n"
 "   \"Usage-based – cost depends on traffic, data transfer, or consumption.\"\n"
-"4. Do NOT infer historical pricing.\n"
-"5. If no fixed-cost resources exist, say exactly:\n"
+"4. If no fixed costs exist, say:\n"
 "   \"No fixed monthly costs detected.\"\n\n"
 "RESOURCES:\n" + ($data | tostring)
               }]
@@ -144,9 +143,9 @@ jobs:
           }
           ' > gemini.json
 
-      # -----------------------------
-      # Gemini API (no cache, no reuse)
-      # -----------------------------
+      # -------------------------------------------------
+      # 8. Gemini API (fresh call)
+      # -------------------------------------------------
       - name: Run Gemini AI
         working-directory: ${{ steps.tfdir.outputs.dir }}
         env:
@@ -159,9 +158,9 @@ jobs:
             | jq -r '.candidates[0].content.parts[0].text' \
             > gemini_response.json
 
-      # -----------------------------
-      # PR comment (fresh every run)
-      # -----------------------------
+      # -------------------------------------------------
+      # 9. Comment on PR
+      # -------------------------------------------------
       - name: Post FinOps comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
