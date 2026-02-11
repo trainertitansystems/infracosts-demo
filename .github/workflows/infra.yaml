@@ -18,37 +18,34 @@ jobs:
 
     steps:
       # -----------------------------------------------------
-      # Checkout PR HEAD ONLY
+      # Checkout PR HEAD (temporary branch only)
       # -----------------------------------------------------
-      - uses: actions/checkout@v4
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       # -----------------------------------------------------
-      # HARD CLEAN (MANDATORY)
-      # Deletes ALL previous artifacts
+      # Authenticate to Google Cloud (Workload Identity)
       # -----------------------------------------------------
-      - name: Hard clean workspace
-        run: |
-          rm -rf .terraform **/.terraform
-          rm -f **/*.tfplan
-          rm -f **/plan.json
-          rm -f **/infracost.json
-          rm -f **/gemini_request.json
-          rm -f **/gemini.md
-
-      # -----------------------------------------------------
-      # Authenticate to GCP (WIF)
-      # -----------------------------------------------------
-      - uses: google-github-actions/auth@v2
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
       # -----------------------------------------------------
-      # Setup Terraform + Infracost
+      # Clean old runtime artifacts (fresh analysis every PR)
+      # -----------------------------------------------------
+      - name: Clean runtime artifacts
+        run: |
+          rm -rf .terraform
+          rm -f *.tfplan *.binary plan.json infracost.json gemini.md
+
+      # -----------------------------------------------------
+      # Setup Terraform & Infracost
       # -----------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
 
@@ -65,13 +62,13 @@ jobs:
       - name: Terraform Plan
         run: terraform plan -out=tfplan.binary -lock=false
 
-      - name: Export Plan JSON
+      - name: Export Terraform Plan JSON
         run: terraform show -json tfplan.binary > plan.json
 
       # -----------------------------------------------------
-      # Infracost (fresh every time)
+      # Infracost (derived from PR plan.json only)
       # -----------------------------------------------------
-      - name: Generate Infracost JSON
+      - name: Run Infracost
         run: |
           infracost breakdown \
             --path plan.json \
@@ -79,15 +76,15 @@ jobs:
             --out-file infracost.json
 
       # -----------------------------------------------------
-      # Extract Monthly Cost
+      # Extract total monthly cost
       # -----------------------------------------------------
-      - name: Extract cost
+      - name: Extract total cost
         run: |
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
       # -----------------------------------------------------
-      # Gemini Analysis (ONLY fresh infracost.json)
+      # Gemini AI Analysis
       # -----------------------------------------------------
       - name: Build Gemini request
         run: |
@@ -111,7 +108,7 @@ jobs:
               }]
             }' > gemini_request.json
 
-      - name: Call Gemini
+      - name: Call Gemini API
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -123,21 +120,22 @@ jobs:
             > gemini.md
 
       # -----------------------------------------------------
-      # PR Comment
+      # Comment on PR (SAFE HEREDOC)
       # -----------------------------------------------------
       - name: Comment PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$(printf '## 💰 Terraform Cost Review
+          {
+            echo "## 💰 Terraform Cost Review"
+            echo ""
+            echo "Estimated Monthly Cost: **$TOTAL USD**"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🤖 Gemini AI Architecture Review"
+            echo ""
+            cat gemini.md
+          } > comment.md
 
-Estimated Monthly Cost: **$%s USD**
-
----
-
-## 🤖 Gemini AI Architecture Review
-
-%s' \
-            "$TOTAL" \
-            "$(cat gemini.md)")"
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
