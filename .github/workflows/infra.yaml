@@ -1,4 +1,4 @@
-name: Terraform PR Cost Review
+name: Terraform PR Cost Delta Review
 
 on:
   pull_request:
@@ -12,127 +12,115 @@ permissions:
   id-token: write
 
 jobs:
-  cost-review:
-    name: Terraform Cost + Gemini Review
+  cost-diff:
     runs-on: ubuntu-latest
 
     steps:
       # -----------------------------------------------------
-      # Checkout PR HEAD
+      # Setup tools
       # -----------------------------------------------------
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: infracost/actions/setup@v3
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Debug PR commit
-        run: |
-          echo "PR SHA: ${{ github.event.pull_request.head.sha }}"
-          git log -1
-
-      # -----------------------------------------------------
-      # Authenticate to GCP (Workload Identity Federation)
-      # -----------------------------------------------------
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
       # -----------------------------------------------------
-      # Cleanup
+      # Checkout BASE (main)
       # -----------------------------------------------------
-      - name: Clean runtime artifacts
-        run: |
-          rm -rf .terraform
-          rm -f *.tfplan *.binary plan.json \
-                infracost.json infracost.md \
-                gemini_request.json gemini.md comment.md
-
-      # -----------------------------------------------------
-      # Setup Terraform + Infracost
-      # -----------------------------------------------------
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Setup Infracost
-        uses: infracost/actions/setup@v3
+      - name: Checkout base branch
+        uses: actions/checkout@v4
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
 
-      # -----------------------------------------------------
-      # Terraform Init (force backend reconfigure)
-      # -----------------------------------------------------
-      - name: Terraform Init
+      - name: Terraform Init (base)
+        working-directory: ./base
         run: terraform init -reconfigure -input=false -lock=false
 
-      # -----------------------------------------------------
-      # Terraform Plan (force refresh)
-      # -----------------------------------------------------
-      - name: Terraform Plan
+      - name: Terraform Plan (base)
+        working-directory: ./base
         run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
 
-      - name: Export Terraform Plan JSON
+      - name: Export base plan
+        working-directory: ./base
         run: terraform show -json tfplan.binary > plan.json
 
       # -----------------------------------------------------
-      # Run Infracost
+      # Checkout PR branch
       # -----------------------------------------------------
-      - name: Generate Infracost JSON
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+
+      - name: Terraform Init (PR)
+        working-directory: ./pr
+        run: terraform init -reconfigure -input=false -lock=false
+
+      - name: Terraform Plan (PR)
+        working-directory: ./pr
+        run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
+
+      - name: Export PR plan
+        working-directory: ./pr
+        run: terraform show -json tfplan.binary > plan.json
+
+      # -----------------------------------------------------
+      # Infracost Diff (ONLY CHANGES)
+      # -----------------------------------------------------
+      - name: Run Infracost diff
         run: |
-          infracost breakdown \
-            --path plan.json \
+          infracost diff \
+            --path ./pr/plan.json \
+            --compare-to ./base/plan.json \
             --format json \
-            --out-file infracost.json
+            --out-file infracost_diff.json
 
-      - name: Validate Infracost JSON
-        run: |
-          test -f infracost.json
-          jq empty infracost.json
-
-      - name: Generate Infracost Table
+      - name: Generate diff table
         run: |
           infracost output \
-            --path infracost.json \
+            --path infracost_diff.json \
             --format table \
             > infracost.md
 
-      - name: Extract Total Monthly Cost
+      - name: Extract Monthly Delta
         run: |
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-          echo "Total Monthly Cost: $TOTAL"
+          DELTA=$(jq '.diffTotalMonthlyCost // 0' infracost_diff.json)
+          echo "DELTA=$DELTA" >> $GITHUB_ENV
+          echo "Monthly cost change: $DELTA"
 
       # -----------------------------------------------------
-      # Build Gemini Request (Safe JSON Construction)
+      # Build Gemini Request (Delta Only)
       # -----------------------------------------------------
       - name: Build Gemini request
         run: |
           jq -n \
-            --arg total "$TOTAL" \
-            --rawfile infra infracost.json \
+            --arg delta "$DELTA" \
+            --rawfile infra infracost_diff.json \
             '{
               contents: [{
                 role: "user",
                 parts: [{
                   text: (
                     "You are a FinOps Cloud Architect.\n\n" +
-                    "Provide:\n" +
-                    "• Monthly cost summary\n" +
-                    "• Cost drivers\n" +
-                    "• Optimization suggestions\n" +
-                    "• Deployment risks\n\n" +
-                    "Total Monthly Cost: $" + $total + " USD\n\n" +
-                    "INFRACOST DATA:\n" + $infra
+                    "Analyze ONLY the infrastructure changes in this PR.\n\n" +
+                    "Monthly Cost Delta: $" + $delta + "\n\n" +
+                    "INFRACOST DIFF DATA:\n" + $infra
                   )
                 }]
               }]
             }' > gemini_request.json
 
       # -----------------------------------------------------
-      # Call Gemini API (Fail Loudly If Broken)
+      # Call Gemini
       # -----------------------------------------------------
       - name: Call Gemini API
         env:
@@ -143,29 +131,27 @@ jobs:
             -H "Content-Type: application/json" \
             -d @gemini_request.json)
 
-          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
-          HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          STATUS=$(echo "$RESPONSE" | tail -n 1)
 
-          echo "Gemini HTTP Status: $HTTP_STATUS"
-
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Gemini API failed:"
-            echo "$HTTP_BODY"
-            echo "Gemini API error. See workflow logs." > gemini.md
-            exit 1
+          if [ "$STATUS" != "200" ]; then
+            echo "Gemini API failed" > gemini.md
+            echo "$BODY"
+          else
+            echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
           fi
 
-          echo "$HTTP_BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
-
       # -----------------------------------------------------
-      # Post PR Comment (Combined)
+      # Post PR Comment (Delta Only)
       # -----------------------------------------------------
       - name: Comment PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "## 💰 Terraform Cost Analysis (Infracost)"
+            echo "## 💰 Terraform Cost Change (PR Only)"
+            echo ""
+            echo "**Monthly Cost Delta: $DELTA USD**"
             echo ""
             echo '```'
             cat infracost.md
@@ -173,7 +159,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "## 🤖 Gemini AI Architecture Review"
+            echo "## 🤖 Gemini AI Review (PR Changes Only)"
             echo ""
             cat gemini.md
           } > comment.md
