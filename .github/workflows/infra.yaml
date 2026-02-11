@@ -17,45 +17,58 @@ jobs:
 
     steps:
       # -----------------------------------------------------
-      # Setup tools
+      # Setup Tools
       # -----------------------------------------------------
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-      - uses: infracost/actions/setup@v3
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - uses: google-github-actions/auth@v2
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # -----------------------------------------------------
-      # Checkout BASE (main)
-      # -----------------------------------------------------
-      - name: Checkout base branch
+      # =====================================================
+      # BASE BRANCH (main)
+      # =====================================================
+
+      - name: Checkout Base Branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           path: base
 
-      - name: Terraform Init (base)
+      - name: Terraform Init (Base)
         working-directory: ./base
         run: terraform init -reconfigure -input=false -lock=false
 
-      - name: Terraform Plan (base)
+      - name: Terraform Plan (Base)
         working-directory: ./base
         run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
 
-      - name: Export base plan
+      - name: Export Base Plan JSON
         working-directory: ./base
         run: terraform show -json tfplan.binary > plan.json
 
-      # -----------------------------------------------------
-      # Checkout PR branch
-      # -----------------------------------------------------
-      - name: Checkout PR branch
+      - name: Generate Infracost JSON (Base)
+        working-directory: ./base
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost-base.json
+
+      # =====================================================
+      # PR BRANCH
+      # =====================================================
+
+      - name: Checkout PR Branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -69,49 +82,59 @@ jobs:
         working-directory: ./pr
         run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
 
-      - name: Export PR plan
+      - name: Export PR Plan JSON
         working-directory: ./pr
         run: terraform show -json tfplan.binary > plan.json
 
-      # -----------------------------------------------------
-      # Infracost Diff (ONLY CHANGES)
-      # -----------------------------------------------------
-      - name: Run Infracost diff
+      - name: Generate Infracost JSON (PR)
+        working-directory: ./pr
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost-pr.json
+
+      # =====================================================
+      # DIFF (ONLY PR CHANGES)
+      # =====================================================
+
+      - name: Run Infracost Diff
         run: |
           infracost diff \
-            --path ./pr/plan.json \
-            --compare-to ./base/plan.json \
+            --path ./pr/infracost-pr.json \
+            --compare-to ./base/infracost-base.json \
             --format json \
-            --out-file infracost_diff.json
+            --out-file infracost-diff.json
 
-      - name: Generate diff table
+      - name: Generate Diff Table
         run: |
           infracost output \
-            --path infracost_diff.json \
+            --path infracost-diff.json \
             --format table \
             > infracost.md
 
       - name: Extract Monthly Delta
         run: |
-          DELTA=$(jq '.diffTotalMonthlyCost // 0' infracost_diff.json)
+          DELTA=$(jq '.diffTotalMonthlyCost // 0' infracost-diff.json)
           echo "DELTA=$DELTA" >> $GITHUB_ENV
           echo "Monthly cost change: $DELTA"
 
-      # -----------------------------------------------------
-      # Build Gemini Request (Delta Only)
-      # -----------------------------------------------------
-      - name: Build Gemini request
+      # =====================================================
+      # GEMINI (Analyze Delta Only)
+      # =====================================================
+
+      - name: Build Gemini Request
         run: |
           jq -n \
             --arg delta "$DELTA" \
-            --rawfile infra infracost_diff.json \
+            --rawfile infra infracost-diff.json \
             '{
               contents: [{
                 role: "user",
                 parts: [{
                   text: (
                     "You are a FinOps Cloud Architect.\n\n" +
-                    "Analyze ONLY the infrastructure changes in this PR.\n\n" +
+                    "Analyze ONLY the infrastructure changes introduced in this PR.\n\n" +
                     "Monthly Cost Delta: $" + $delta + "\n\n" +
                     "INFRACOST DIFF DATA:\n" + $infra
                   )
@@ -119,9 +142,6 @@ jobs:
               }]
             }' > gemini_request.json
 
-      # -----------------------------------------------------
-      # Call Gemini
-      # -----------------------------------------------------
       - name: Call Gemini API
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -141,9 +161,10 @@ jobs:
             echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
           fi
 
-      # -----------------------------------------------------
-      # Post PR Comment (Delta Only)
-      # -----------------------------------------------------
+      # =====================================================
+      # POST PR COMMENT (DELTA ONLY)
+      # =====================================================
+
       - name: Comment PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
