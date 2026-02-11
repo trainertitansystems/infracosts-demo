@@ -4,7 +4,8 @@ on:
   pull_request:
     branches: [ main ]
     paths:
-      - "**/*.tf"
+      - "vpc/**"
+      - "pubsub/**"
 
 permissions:
   contents: read
@@ -16,9 +17,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # -----------------------------------------------------
-      # Setup Tools
-      # -----------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -34,95 +32,103 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # =====================================================
-      # BASE BRANCH (main)
-      # =====================================================
+      # --------------------------------------------
+      # Detect changed Terraform directory
+      # --------------------------------------------
+      - name: Detect changed directory
+        id: detect
+        run: |
+          git fetch origin main
+          CHANGED=$(git diff --name-only origin/main | cut -d/ -f1 | sort -u)
+          echo "Changed folders:"
+          echo "$CHANGED"
 
-      - name: Checkout Base Branch
+          if echo "$CHANGED" | grep -q "^vpc$"; then
+            echo "DIR=vpc" >> $GITHUB_ENV
+          elif echo "$CHANGED" | grep -q "^pubsub$"; then
+            echo "DIR=pubsub" >> $GITHUB_ENV
+          else
+            echo "No Terraform folder changed."
+            exit 1
+          fi
+
+      # --------------------------------------------
+      # Checkout BASE
+      # --------------------------------------------
+      - name: Checkout Base
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: main
           path: base
 
       - name: Terraform Init (Base)
-        working-directory: ./base
+        working-directory: ./base/${{ env.DIR }}
         run: terraform init -reconfigure -input=false -lock=false
 
       - name: Terraform Plan (Base)
-        working-directory: ./base
+        working-directory: ./base/${{ env.DIR }}
         run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
 
-      - name: Export Base Plan JSON
-        working-directory: ./base
+      - name: Export Base Plan
+        working-directory: ./base/${{ env.DIR }}
         run: terraform show -json tfplan.binary > plan.json
 
-      - name: Generate Infracost JSON (Base)
-        working-directory: ./base
+      - name: Infracost Base
+        working-directory: ./base/${{ env.DIR }}
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost-base.json
 
-      # =====================================================
-      # PR BRANCH
-      # =====================================================
-
-      - name: Checkout PR Branch
+      # --------------------------------------------
+      # Checkout PR
+      # --------------------------------------------
+      - name: Checkout PR
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr
 
       - name: Terraform Init (PR)
-        working-directory: ./pr
+        working-directory: ./pr/${{ env.DIR }}
         run: terraform init -reconfigure -input=false -lock=false
 
       - name: Terraform Plan (PR)
-        working-directory: ./pr
+        working-directory: ./pr/${{ env.DIR }}
         run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
 
-      - name: Export PR Plan JSON
-        working-directory: ./pr
+      - name: Export PR Plan
+        working-directory: ./pr/${{ env.DIR }}
         run: terraform show -json tfplan.binary > plan.json
 
-      - name: Generate Infracost JSON (PR)
-        working-directory: ./pr
+      - name: Infracost PR
+        working-directory: ./pr/${{ env.DIR }}
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost-pr.json
 
-      # =====================================================
-      # DIFF (ONLY PR CHANGES)
-      # =====================================================
-
-      - name: Run Infracost Diff
+      # --------------------------------------------
+      # Diff
+      # --------------------------------------------
+      - name: Infracost Diff
         run: |
           infracost diff \
-            --path ./pr/infracost-pr.json \
-            --compare-to ./base/infracost-base.json \
+            --path ./pr/${{ env.DIR }}/infracost-pr.json \
+            --compare-to ./base/${{ env.DIR }}/infracost-base.json \
             --format json \
             --out-file infracost-diff.json
 
-      - name: Generate Diff Table
-        run: |
-          infracost output \
-            --path infracost-diff.json \
-            --format table \
-            > infracost.md
-
-      - name: Extract Monthly Delta
+      - name: Extract Delta
         run: |
           DELTA=$(jq '.diffTotalMonthlyCost // 0' infracost-diff.json)
           echo "DELTA=$DELTA" >> $GITHUB_ENV
-          echo "Monthly cost change: $DELTA"
 
-      # =====================================================
-      # GEMINI (Analyze Delta Only)
-      # =====================================================
-
+      # --------------------------------------------
+      # Gemini (fixed endpoint)
+      # --------------------------------------------
       - name: Build Gemini Request
         run: |
           jq -n \
@@ -133,8 +139,7 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "You are a FinOps Cloud Architect.\n\n" +
-                    "Analyze ONLY the infrastructure changes introduced in this PR.\n\n" +
+                    "Analyze ONLY this PR's infrastructure changes.\n\n" +
                     "Monthly Cost Delta: $" + $delta + "\n\n" +
                     "INFRACOST DIFF DATA:\n" + $infra
                   )
@@ -146,43 +151,32 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+          curl -s \
+            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini_request.json)
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text' \
+            > gemini.md
 
-          BODY=$(echo "$RESPONSE" | head -n -1)
-          STATUS=$(echo "$RESPONSE" | tail -n 1)
-
-          if [ "$STATUS" != "200" ]; then
-            echo "Gemini API failed" > gemini.md
-            echo "$BODY"
-          else
-            echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
-          fi
-
-      # =====================================================
-      # POST PR COMMENT (DELTA ONLY)
-      # =====================================================
-
+      # --------------------------------------------
+      # Comment PR
+      # --------------------------------------------
       - name: Comment PR
+        working-directory: ./pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "## 💰 Terraform Cost Change (PR Only)"
+            echo "## 💰 Terraform Cost Change (${DIR})"
             echo ""
             echo "**Monthly Cost Delta: $DELTA USD**"
             echo ""
             echo '```'
-            cat infracost.md
+            cat ../infracost-diff.json
             echo '```'
             echo ""
-            echo "---"
-            echo ""
-            echo "## 🤖 Gemini AI Review (PR Changes Only)"
-            echo ""
-            cat gemini.md
+            echo "## 🤖 Gemini Review"
+            cat ../gemini.md
           } > comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} \
