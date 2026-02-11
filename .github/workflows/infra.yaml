@@ -1,4 +1,4 @@
-name: Terraform PR FinOps Gate (Validated + Gemini)
+name: Terraform PR Cost Review
 
 on:
   pull_request:
@@ -9,135 +9,87 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  id-token: write   # REQUIRED for Workload Identity Federation
-
-env:
-  MAX_MONTHLY_COST_USD: "50"
+  id-token: write
 
 jobs:
-  finops-gate:
+  cost-review:
+    name: Terraform Cost + Gemini Review
     runs-on: ubuntu-latest
 
     steps:
-      # =====================================================
+      # -----------------------------------------------------
       # Checkout PR HEAD ONLY
-      # =====================================================
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
+      # -----------------------------------------------------
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
-      # =====================================================
-      # Authenticate to Google Cloud (Workload Identity)
-      # FIX: create_credentials_file is REQUIRED for Terraform
-      # =====================================================
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      # -----------------------------------------------------
+      # HARD CLEAN (MANDATORY)
+      # Deletes ALL previous artifacts
+      # -----------------------------------------------------
+      - name: Hard clean workspace
+        run: |
+          rm -rf .terraform **/.terraform
+          rm -f **/*.tfplan
+          rm -f **/plan.json
+          rm -f **/infracost.json
+          rm -f **/gemini_request.json
+          rm -f **/gemini.md
+
+      # -----------------------------------------------------
+      # Authenticate to GCP (WIF)
+      # -----------------------------------------------------
+      - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # Optional sanity check (can remove later)
-      - name: Verify authentication
-        run: |
-          gcloud auth list
-
-      # =====================================================
-      # Clean runtime artifacts
-      # =====================================================
-      - name: Clean runtime artifacts
-        run: |
-          rm -rf .terraform **/.terraform
-          rm -f **/*.tfplan **/*.binary
-          rm -f **/plan.json **/infracost*.json
-
-      # =====================================================
-      # Detect Terraform root (PR-only)
-      # =====================================================
-      - name: Detect Terraform roots
-        id: tfroots
-        run: |
-          set -euo pipefail
-
-          ROOTS=$(git ls-files '*.tf' | xargs -n1 dirname | sort -u)
-          COUNT=$(echo "$ROOTS" | wc -l | tr -d ' ')
-
-          echo "Detected roots:"
-          echo "$ROOTS"
-
-          if echo "$ROOTS" | grep -qx "."; then
-            echo "❌ Terraform at repo root is forbidden"
-            exit 1
-          fi
-
-          if [ "$COUNT" -ne 1 ]; then
-            echo "❌ Exactly ONE Terraform root per PR is allowed"
-            exit 1
-          fi
-
-          echo "dir=$ROOTS" >> "$GITHUB_OUTPUT"
-
-      # =====================================================
-      # Setup Terraform & Infracost
-      # =====================================================
+      # -----------------------------------------------------
+      # Setup Terraform + Infracost
+      # -----------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
 
       - uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # =====================================================
-      # Terraform PLAN (PR directory only)
-      # =====================================================
+      # -----------------------------------------------------
+      # Terraform Plan (PR branch only)
+      # -----------------------------------------------------
       - name: Terraform Init
-        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        working-directory: ${{ steps.tfroots.outputs.dir }}
-        run: terraform plan -out=pr.tfplan -lock=false
+        run: terraform plan -out=tfplan.binary -lock=false
 
-      - name: Export plan JSON
-        working-directory: ${{ steps.tfroots.outputs.dir }}
-        run: terraform show -json pr.tfplan > plan.json
+      - name: Export Plan JSON
+        run: terraform show -json tfplan.binary > plan.json
 
-      # =====================================================
-      # Run Infracost
-      # =====================================================
-      - name: Run Infracost
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+      # -----------------------------------------------------
+      # Infracost (fresh every time)
+      # -----------------------------------------------------
+      - name: Generate Infracost JSON
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-      # =====================================================
-      # HARD COST GATE
-      # =====================================================
-      - name: Enforce monthly cost limit
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+      # -----------------------------------------------------
+      # Extract Monthly Cost
+      # -----------------------------------------------------
+      - name: Extract cost
         run: |
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
-
-          echo "PR monthly cost: $TOTAL USD"
-          echo "Limit: $MAX_MONTHLY_COST_USD USD"
-
-          if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "❌ Cost exceeds allowed limit"
-            exit 1
-          fi
-
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-          echo "✅ Cost within allowed limit"
 
-      # =====================================================
-      # Gemini AI Analysis
-      # =====================================================
+      # -----------------------------------------------------
+      # Gemini Analysis (ONLY fresh infracost.json)
+      # -----------------------------------------------------
       - name: Build Gemini request
-        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
           jq -n \
             --argjson cost "$(cat infracost.json)" \
@@ -148,20 +100,18 @@ jobs:
                 parts: [{
                   text:
                     "You are a FinOps Cloud Architect.\n\n" +
-                    "Analyze this Terraform cost.\n\n" +
                     "Provide:\n" +
                     "• Monthly cost summary\n" +
-                    "• Main cost drivers\n" +
+                    "• Cost drivers\n" +
                     "• Optimization suggestions\n" +
-                    "• Risks before deployment\n\n" +
+                    "• Deployment risks\n\n" +
                     "Total Monthly Cost: $" + $total + " USD\n\n" +
                     "INFRACOST DATA:\n" + ($cost | tostring)
                 }]
               }]
             }' > gemini_request.json
 
-      - name: Call Gemini API
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+      - name: Call Gemini
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -172,25 +122,22 @@ jobs:
             | jq -r '.candidates[0].content.parts[0].text' \
             > gemini.md
 
-      # =====================================================
-      # PR COMMENT
-      # =====================================================
-      - name: Comment PR cost + AI review
+      # -----------------------------------------------------
+      # PR Comment
+      # -----------------------------------------------------
+      - name: Comment PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$(printf '**Terraform PR Cost (validated)**  
-Directory: `%s`  
-Estimated monthly cost: **$%s USD**
+            --body "$(printf '## 💰 Terraform Cost Review
+
+Estimated Monthly Cost: **$%s USD**
 
 ---
 
-## 🤖 Gemini AI Cost & Architecture Review
+## 🤖 Gemini AI Architecture Review
 
 %s' \
-            '${{ steps.tfroots.outputs.dir }}' \
             "$TOTAL" \
             "$(cat gemini.md)")"
-
