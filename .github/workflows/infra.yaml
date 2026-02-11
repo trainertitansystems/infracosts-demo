@@ -18,7 +18,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------
-      # Checkout PR HEAD (temporary branch only)
+      # Checkout PR HEAD ONLY
       # -----------------------------------------------------
       - name: Checkout PR branch
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 1
 
       # -----------------------------------------------------
-      # Authenticate to Google Cloud (Workload Identity)
+      # Authenticate to GCP (Workload Identity Federation)
       # -----------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -37,15 +37,15 @@ jobs:
           create_credentials_file: true
 
       # -----------------------------------------------------
-      # Clean old runtime artifacts (fresh analysis every PR)
+      # Clean runtime artifacts (fresh analysis per PR)
       # -----------------------------------------------------
       - name: Clean runtime artifacts
         run: |
           rm -rf .terraform
-          rm -f *.tfplan *.binary plan.json infracost.json gemini.md
+          rm -f *.tfplan *.binary plan.json infracost.json gemini_request.json gemini.md comment.md
 
       # -----------------------------------------------------
-      # Setup Terraform & Infracost
+      # Setup Terraform + Infracost
       # -----------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
 
@@ -66,7 +66,7 @@ jobs:
         run: terraform show -json tfplan.binary > plan.json
 
       # -----------------------------------------------------
-      # Infracost (derived from PR plan.json only)
+      # Infracost (derived ONLY from PR plan.json)
       # -----------------------------------------------------
       - name: Run Infracost
         run: |
@@ -84,26 +84,30 @@ jobs:
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
       # -----------------------------------------------------
-      # Gemini AI Analysis
+      # Gemini AI Analysis (SAFE VERSION)
       # -----------------------------------------------------
       - name: Build Gemini request
         run: |
+          CONTENT="You are a FinOps Cloud Architect.
+
+Provide:
+• Monthly cost summary
+• Cost drivers
+• Optimization suggestions
+• Deployment risks
+
+Total Monthly Cost: $TOTAL USD
+
+INFRACOST DATA:
+$(cat infracost.json)"
+
           jq -n \
-            --argjson cost "$(cat infracost.json)" \
-            --arg total "$TOTAL" \
+            --arg text "$CONTENT" \
             '{
               contents: [{
                 role: "user",
                 parts: [{
-                  text:
-                    "You are a FinOps Cloud Architect.\n\n" +
-                    "Provide:\n" +
-                    "• Monthly cost summary\n" +
-                    "• Cost drivers\n" +
-                    "• Optimization suggestions\n" +
-                    "• Deployment risks\n\n" +
-                    "Total Monthly Cost: $" + $total + " USD\n\n" +
-                    "INFRACOST DATA:\n" + ($cost | tostring)
+                  text: $text
                 }]
               }]
             }' > gemini_request.json
@@ -120,7 +124,7 @@ jobs:
             > gemini.md
 
       # -----------------------------------------------------
-      # Comment on PR (SAFE HEREDOC)
+      # Comment on PR (YAML-safe)
       # -----------------------------------------------------
       - name: Comment PR
         env:
