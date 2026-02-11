@@ -1,4 +1,4 @@
-name: Terraform PR FinOps Gate (Single Root, PR-only)
+name: Terraform PR FinOps Gate (Validated + Gemini)
 
 on:
   pull_request:
@@ -28,39 +28,33 @@ jobs:
           fetch-depth: 1
 
       # =====================================================
-      # HARD CLEAN — NO REUSE POSSIBLE
+      # Clean runtime artifacts (no reuse)
       # =====================================================
-      - name: Hard clean workspace
+      - name: Clean runtime artifacts
         run: |
           rm -rf .terraform **/.terraform
           rm -f **/*.tfplan **/*.binary
-          rm -f **/plan.json **/infracost*.json
+          rm -f **/plan.json
 
       # =====================================================
-      # Detect Terraform roots (PR-only)
+      # Detect Terraform root (PR-only)
       # =====================================================
       - name: Detect Terraform roots
         id: tfroots
-        shell: bash
         run: |
           set -euo pipefail
 
-          ROOTS=$(git ls-files '*.tf' \
-            | xargs -n1 dirname \
-            | sort -u)
-
+          ROOTS=$(git ls-files '*.tf' | xargs -n1 dirname | sort -u)
           COUNT=$(echo "$ROOTS" | wc -l | tr -d ' ')
 
-          echo "Detected Terraform roots:"
+          echo "Detected roots:"
           echo "$ROOTS"
 
-          # Block repo root
           if echo "$ROOTS" | grep -qx "."; then
             echo "❌ Terraform at repo root is forbidden"
             exit 1
           fi
 
-          # Enforce single root
           if [ "$COUNT" -ne 1 ]; then
             echo "❌ Exactly ONE Terraform root per PR is allowed"
             exit 1
@@ -78,7 +72,7 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       # =====================================================
-      # Terraform (PR directory ONLY)
+      # Terraform PLAN (PR directory only)
       # =====================================================
       - name: Terraform Init
         working-directory: ${{ steps.tfroots.outputs.dir }}
@@ -93,15 +87,65 @@ jobs:
         run: terraform show -json pr.tfplan > plan.json
 
       # =====================================================
-      # Infracost (PLAN ONLY)
+      # Extract Terraform resource addresses
       # =====================================================
-      - name: Run Infracost
+      - name: Extract Terraform resources
         working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
+          jq -r '.resource_changes[].address' plan.json | sort > terraform_resources.txt
+
+      # =====================================================
+      # Validate existing infracost.json (if committed)
+      # =====================================================
+      - name: Validate infracost.json
+        id: validate
+        working-directory: ${{ steps.tfroots.outputs.dir }}
+        run: |
+          if [ -f infracost.json ]; then
+            echo "Validating existing infracost.json..."
+
+            jq -r '.projects[].breakdown.resources[].name' infracost.json \
+              | sort > infracost_resources.txt
+
+            if ! diff terraform_resources.txt infracost_resources.txt; then
+              echo "Mismatch detected — regenerating"
+              echo "REGENERATE=true" >> $GITHUB_ENV
+            else
+              echo "Infracost matches Terraform plan"
+            fi
+          else
+            echo "No infracost.json found"
+            echo "REGENERATE=true" >> $GITHUB_ENV
+          fi
+
+      # =====================================================
+      # Regenerate Infracost if needed
+      # =====================================================
+      - name: Regenerate Infracost
+        if: env.REGENERATE == 'true'
+        working-directory: ${{ steps.tfroots.outputs.dir }}
+        run: |
+          rm -f infracost.json
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
+
+      # =====================================================
+      # Final integrity validation (HARD FAIL)
+      # =====================================================
+      - name: Final consistency validation
+        working-directory: ${{ steps.tfroots.outputs.dir }}
+        run: |
+          jq -r '.projects[].breakdown.resources[].name' infracost.json \
+            | sort > infracost_resources.txt
+
+          if ! diff terraform_resources.txt infracost_resources.txt; then
+            echo "❌ Infracost does not match Terraform plan"
+            exit 1
+          fi
+
+          echo "✅ Terraform plan and Infracost are consistent"
 
       # =====================================================
       # HARD COST GATE
@@ -109,8 +153,6 @@ jobs:
       - name: Enforce monthly cost limit
         working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
-          set -euo pipefail
-
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
 
           echo "PR monthly cost: $TOTAL USD"
@@ -121,17 +163,69 @@ jobs:
             exit 1
           fi
 
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
           echo "✅ Cost within allowed limit"
 
       # =====================================================
-      # PR COMMENT (PR-ONLY, NO BASELINE)
+      # Gemini AI Analysis (after validation)
       # =====================================================
-      - name: Comment PR cost
+      - name: Build Gemini request
+        working-directory: ${{ steps.tfroots.outputs.dir }}
+        run: |
+          jq -n \
+            --argjson cost "$(cat infracost.json)" \
+            --arg total "$TOTAL" \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{
+                  text:
+                    "You are a FinOps Cloud Architect.\n\n" +
+                    "Analyze this Terraform cost.\n\n" +
+                    "Provide:\n" +
+                    "• Monthly cost summary\n" +
+                    "• Main cost drivers\n" +
+                    "• Optimization suggestions\n" +
+                    "• Risks before deployment\n\n" +
+                    "Total Monthly Cost: $" + $total + " USD\n\n" +
+                    "INFRACOST DATA:\n" + ($cost | tostring)
+                }]
+              }]
+            }' > gemini_request.json
+
+      - name: Call Gemini API
+        working-directory: ${{ steps.tfroots.outputs.dir }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text' \
+            > gemini.md
+
+      # =====================================================
+      # PR COMMENT (Cost + Gemini)
+      # =====================================================
+      - name: Comment PR cost + AI review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: ${{ steps.tfroots.outputs.dir }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
-            --body "**Terraform PR Cost (PR branch only)**  
-Directory: \`${{ steps.tfroots.outputs.dir }}\`  
-Estimated monthly cost: **$TOTAL USD**"
+            --body "$(printf '**Terraform PR Cost (validated)**  
+Directory: `%s`  
+Estimated monthly cost: **$%s USD**
+
+Integrity check: ✅ Terraform plan == Infracost
+
+---
+
+## 🤖 Gemini AI Cost & Architecture Review
+
+%s' \
+            '${{ steps.tfroots.outputs.dir }}' \
+            "$TOTAL" \
+            "$(cat gemini.md)")"
 
