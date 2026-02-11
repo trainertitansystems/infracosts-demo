@@ -18,7 +18,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------
-      # Checkout PR HEAD ONLY
+      # Checkout PR HEAD
       # -----------------------------------------------------
       - name: Checkout PR branch
         uses: actions/checkout@v4
@@ -37,81 +37,88 @@ jobs:
           create_credentials_file: true
 
       # -----------------------------------------------------
-      # Clean runtime artifacts (fresh analysis per PR)
+      # Cleanup
       # -----------------------------------------------------
       - name: Clean runtime artifacts
         run: |
           rm -rf .terraform
-          rm -f *.tfplan *.binary plan.json infracost.json gemini_request.json gemini.md comment.md
+          rm -f *.tfplan *.binary plan.json infracost.json \
+                infracost.md gemini.md gemini_request.json comment.md
 
       # -----------------------------------------------------
       # Setup Terraform + Infracost
       # -----------------------------------------------------
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-      - uses: infracost/actions/setup@v3
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       # -----------------------------------------------------
-      # Terraform Plan (PR branch only)
+      # Terraform Plan
       # -----------------------------------------------------
       - name: Terraform Init
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        run: terraform plan -out=tfplan.binary -lock=false
+        run: terraform plan -out=tfplan.binary -input=false -lock=false
 
       - name: Export Terraform Plan JSON
         run: terraform show -json tfplan.binary > plan.json
 
       # -----------------------------------------------------
-      # Infracost (derived ONLY from PR plan.json)
+      # Run Infracost
       # -----------------------------------------------------
-      - name: Run Infracost
+      - name: Generate Infracost JSON
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-      # -----------------------------------------------------
-      # Extract total monthly cost
-      # -----------------------------------------------------
-      - name: Extract total cost
+      - name: Generate Infracost Markdown
         run: |
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
+          infracost output \
+            --path infracost.json \
+            --format table \
+            > infracost.md
+
+      - name: Extract Total Monthly Cost
+        run: |
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
       # -----------------------------------------------------
-      # Gemini AI Analysis (SAFE VERSION)
+      # Build Gemini Request (Safe)
       # -----------------------------------------------------
       - name: Build Gemini request
         run: |
-          CONTENT="You are a FinOps Cloud Architect.
-
-Provide:
-• Monthly cost summary
-• Cost drivers
-• Optimization suggestions
-• Deployment risks
-
-Total Monthly Cost: $TOTAL USD
-
-INFRACOST DATA:
-$(cat infracost.json)"
-
           jq -n \
-            --arg text "$CONTENT" \
+            --arg total "$TOTAL" \
+            --rawfile infra infracost.json \
             '{
               contents: [{
                 role: "user",
                 parts: [{
-                  text: $text
+                  text: (
+                    "You are a FinOps Cloud Architect.\n\n" +
+                    "Provide:\n" +
+                    "• Monthly cost summary\n" +
+                    "• Cost drivers\n" +
+                    "• Optimization suggestions\n" +
+                    "• Deployment risks\n\n" +
+                    "Total Monthly Cost: $" + $total + " USD\n\n" +
+                    "INFRACOST DATA:\n" + $infra
+                  )
                 }]
               }]
             }' > gemini_request.json
 
+      # -----------------------------------------------------
+      # Call Gemini API
+      # -----------------------------------------------------
       - name: Call Gemini API
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -120,20 +127,22 @@ $(cat infracost.json)"
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @gemini_request.json \
-            | jq -r '.candidates[0].content.parts[0].text' \
+            | jq -r '.candidates[0].content.parts[0].text // "Gemini analysis unavailable."' \
             > gemini.md
 
       # -----------------------------------------------------
-      # Comment on PR (YAML-safe)
+      # Post Combined PR Comment
       # -----------------------------------------------------
-      - name: Comment PR
+      - name: Comment PR with Infracost + Gemini
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "## 💰 Terraform Cost Review"
+            echo "## 💰 Terraform Cost Analysis (Infracost)"
             echo ""
-            echo "Estimated Monthly Cost: **$TOTAL USD**"
+            echo '```'
+            cat infracost.md
+            echo '```'
             echo ""
             echo "---"
             echo ""
@@ -142,4 +151,5 @@ $(cat infracost.json)"
             cat gemini.md
           } > comment.md
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file comment.md
