@@ -1,4 +1,3 @@
-#inside
 
 terraform {
   required_providers {
