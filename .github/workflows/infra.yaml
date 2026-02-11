@@ -1,11 +1,10 @@
-name: Terraform PR Cost Delta Review
+name: Terraform PR Cost Review (Dynamic)
 
 on:
   pull_request:
     branches: [ main ]
     paths:
-      - "vpc/**"
-      - "pubsub/**"
+      - "**/*.tf"
 
 permissions:
   contents: read
@@ -13,10 +12,21 @@ permissions:
   id-token: write
 
 jobs:
-  cost-diff:
+  cost-review:
     runs-on: ubuntu-latest
 
     steps:
+      # -------------------------------------------------
+      # Checkout PR branch
+      # -------------------------------------------------
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------
+      # Setup Tools
+      # -------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -32,116 +42,78 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # --------------------------------------------
-      # Detect changed Terraform directory
-      # --------------------------------------------
-      - name: Detect changed directory
+      # -------------------------------------------------
+      # Detect changed Terraform folders
+      # -------------------------------------------------
+      - name: Detect changed Terraform directories
         id: detect
         run: |
           git fetch origin main
-          CHANGED=$(git diff --name-only origin/main | cut -d/ -f1 | sort -u)
-          echo "Changed folders:"
-          echo "$CHANGED"
 
-          if echo "$CHANGED" | grep -q "^vpc$"; then
-            echo "DIR=vpc" >> $GITHUB_ENV
-          elif echo "$CHANGED" | grep -q "^pubsub$"; then
-            echo "DIR=pubsub" >> $GITHUB_ENV
-          else
-            echo "No Terraform folder changed."
-            exit 1
+          CHANGED_DIRS=$(git diff --name-only origin/main \
+            | grep '\.tf$' \
+            | cut -d/ -f1 \
+            | sort -u)
+
+          echo "Detected folders:"
+          echo "$CHANGED_DIRS"
+
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "No Terraform changes detected."
+            exit 0
           fi
 
-      # --------------------------------------------
-      # Checkout BASE
-      # --------------------------------------------
-      - name: Checkout Base
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          path: base
+          echo "DIRS<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_DIRS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-      - name: Terraform Init (Base)
-        working-directory: ./base/${{ env.DIR }}
-        run: terraform init -reconfigure -input=false -lock=false
-
-      - name: Terraform Plan (Base)
-        working-directory: ./base/${{ env.DIR }}
-        run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
-
-      - name: Export Base Plan
-        working-directory: ./base/${{ env.DIR }}
-        run: terraform show -json tfplan.binary > plan.json
-
-      - name: Infracost Base
-        working-directory: ./base/${{ env.DIR }}
+      # -------------------------------------------------
+      # Run Terraform + Infracost per folder
+      # -------------------------------------------------
+      - name: Run Terraform + Infracost
         run: |
-          infracost breakdown \
-            --path plan.json \
-            --format json \
-            --out-file infracost-base.json
+          echo "" > combined.md
 
-      # --------------------------------------------
-      # Checkout PR
-      # --------------------------------------------
-      - name: Checkout PR
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: pr
+          for DIR in $DIRS; do
+            if [ -d "$DIR" ]; then
+              echo "Processing $DIR"
 
-      - name: Terraform Init (PR)
-        working-directory: ./pr/${{ env.DIR }}
-        run: terraform init -reconfigure -input=false -lock=false
+              cd $DIR
 
-      - name: Terraform Plan (PR)
-        working-directory: ./pr/${{ env.DIR }}
-        run: terraform plan -refresh=true -out=tfplan.binary -input=false -lock=false
+              terraform init -reconfigure -input=false
+              terraform plan -refresh=true -out=tfplan.binary -input=false
+              terraform show -json tfplan.binary > plan.json
 
-      - name: Export PR Plan
-        working-directory: ./pr/${{ env.DIR }}
-        run: terraform show -json tfplan.binary > plan.json
+              infracost breakdown \
+                --path plan.json \
+                --format table \
+                --out-file infracost.md
 
-      - name: Infracost PR
-        working-directory: ./pr/${{ env.DIR }}
-        run: |
-          infracost breakdown \
-            --path plan.json \
-            --format json \
-            --out-file infracost-pr.json
+              echo "## 📦 $DIR" >> ../combined.md
+              echo "" >> ../combined.md
+              echo '```' >> ../combined.md
+              cat infracost.md >> ../combined.md
+              echo '```' >> ../combined.md
+              echo "" >> ../combined.md
 
-      # --------------------------------------------
-      # Diff
-      # --------------------------------------------
-      - name: Infracost Diff
-        run: |
-          infracost diff \
-            --path ./pr/${{ env.DIR }}/infracost-pr.json \
-            --compare-to ./base/${{ env.DIR }}/infracost-base.json \
-            --format json \
-            --out-file infracost-diff.json
+              cd ..
+            fi
+          done
 
-      - name: Extract Delta
-        run: |
-          DELTA=$(jq '.diffTotalMonthlyCost // 0' infracost-diff.json)
-          echo "DELTA=$DELTA" >> $GITHUB_ENV
-
-      # --------------------------------------------
-      # Gemini (fixed endpoint)
-      # --------------------------------------------
+      # -------------------------------------------------
+      # Gemini Analysis (PR Plan Only)
+      # -------------------------------------------------
       - name: Build Gemini Request
         run: |
           jq -n \
-            --arg delta "$DELTA" \
-            --rawfile infra infracost-diff.json \
+            --rawfile infra combined.md \
             '{
               contents: [{
                 role: "user",
                 parts: [{
                   text: (
-                    "Analyze ONLY this PR's infrastructure changes.\n\n" +
-                    "Monthly Cost Delta: $" + $delta + "\n\n" +
-                    "INFRACOST DIFF DATA:\n" + $infra
+                    "Analyze ONLY the Terraform changes introduced in this PR.\n\n" +
+                    $infra
                   )
                 }]
               }]
@@ -158,25 +130,22 @@ jobs:
             | jq -r '.candidates[0].content.parts[0].text' \
             > gemini.md
 
-      # --------------------------------------------
+      # -------------------------------------------------
       # Comment PR
-      # --------------------------------------------
+      # -------------------------------------------------
       - name: Comment PR
-        working-directory: ./pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "## 💰 Terraform Cost Change (${DIR})"
+            echo "## 💰 Terraform PR Cost Impact"
             echo ""
-            echo "**Monthly Cost Delta: $DELTA USD**"
+            cat combined.md
             echo ""
-            echo '```'
-            cat ../infracost-diff.json
-            echo '```'
+            echo "---"
             echo ""
             echo "## 🤖 Gemini Review"
-            cat ../gemini.md
+            cat gemini.md
           } > comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} \
