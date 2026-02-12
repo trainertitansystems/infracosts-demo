@@ -35,7 +35,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Authenticate to GCP
+      - name: Authenticate to GCP (for Terraform backend)
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
@@ -48,6 +48,7 @@ jobs:
       - name: Detect changed Terraform directories
         id: detect
         run: |
+          set -e
           git fetch origin main
 
           DIRS=$(git diff --name-only origin/main \
@@ -111,7 +112,6 @@ jobs:
             --rawfile infra combined.md \
             '{
               contents: [{
-                role: "user",
                 parts: [{
                   text: (
                     "You are a FinOps and Cloud Architecture expert.\n\n" +
@@ -124,7 +124,7 @@ jobs:
             }' > gemini_request.json
 
       # -------------------------------------------------
-      # Call Gemini API (Stable + Safe)
+      # Call Gemini API (WORKING VERSION)
       # -------------------------------------------------
       - name: Call Gemini API
         if: env.NO_CHANGES != 'true'
@@ -134,8 +134,10 @@ jobs:
           set -e
 
           RESPONSE=$(curl -s -w "\n%{http_code}" \
-            "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key=$GEMINI_API_KEY" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
+            -H "X-goog-api-key: $GEMINI_API_KEY" \
+            -X POST \
             -d @gemini_request.json)
 
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -147,9 +149,10 @@ jobs:
             echo "Gemini API failed:"
             echo "$BODY"
             echo "Gemini API failed. See workflow logs." > gemini.md
-          else
-            echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
+            exit 1
           fi
+
+          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
 
       # -------------------------------------------------
       # Comment PR
