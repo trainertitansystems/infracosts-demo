@@ -1,4 +1,5 @@
-name: Terraform PR FinOps Gate (Validated + Gemini)
+name: Terraform PR FinOps Gate
+
 on:
   pull_request:
     branches: [ main ]
@@ -16,13 +17,21 @@ env:
 jobs:
   finops-gate:
     runs-on: ubuntu-latest
+
     steps:
+
+      # --------------------------------------------------
+      # Checkout PR HEAD
+      # --------------------------------------------------
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
 
+      # --------------------------------------------------
+      # Authenticate to Google Cloud
+      # --------------------------------------------------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -30,113 +39,175 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      - name: Clean runtime artifacts
+      # --------------------------------------------------
+      # Install bc for numeric comparisons
+      # --------------------------------------------------
+      - name: Install bc
         run: |
-          rm -rf .terraform **/.terraform
-          rm -f **/*.tfplan **/*.binary
-          rm -f **/plan.json **/infracost*.json
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc
 
-      - name: Detect Terraform roots
-        id: tfroots
+      # --------------------------------------------------
+      # Detect Terraform directory based on PR changes
+      # --------------------------------------------------
+      - name: Detect Terraform directory from PR changes
+        id: tfdir
         run: |
           set -euo pipefail
-          ROOTS=$(git ls-files '*.tf' | xargs -n1 dirname | sort -u)
-          COUNT=$(echo "$ROOTS" | wc -l | tr -d ' ')
-          if echo "$ROOTS" | grep -qx "."; then
-            echo "❌ Terraform at repo root is forbidden"
-            exit 1
-          fi
-          if [ "$COUNT" -ne 1 ]; then
-            echo "❌ Exactly ONE Terraform root per PR is allowed"
-            exit 1
-          fi
-          echo "dir=$ROOTS" >> "$GITHUB_OUTPUT"
+          git fetch origin main
 
+          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
+            | grep '\.tf$' \
+            | xargs -I {} dirname {} \
+            | sort -u)
+
+          COUNT=$(echo "$CHANGED_DIRS" | wc -l | tr -d ' ')
+
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "❌ No Terraform changes detected in PR"
+            exit 1
+          fi
+
+          if [ "$COUNT" -ne 1 ]; then
+            echo "❌ Exactly ONE Terraform directory must be modified per PR"
+            echo "Changed directories:"
+            echo "$CHANGED_DIRS"
+            exit 1
+          fi
+
+          echo "dir=$CHANGED_DIRS" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # Setup Terraform and Infracost
+      # --------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
+
       - uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
+      # --------------------------------------------------
+      # Terraform Plan
+      # --------------------------------------------------
       - name: Terraform Init
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform plan -out=pr.tfplan -lock=false
 
-      - name: Export plan JSON
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+      - name: Export Plan JSON
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform show -json pr.tfplan > plan.json
 
+      # --------------------------------------------------
+      # Infracost Breakdown
+      # --------------------------------------------------
       - name: Run Infracost
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
+      # --------------------------------------------------
+      # Hard Monthly Cost Gate
+      # --------------------------------------------------
       - name: Enforce monthly cost limit
-        id: cost_check
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add' infracost.json)
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-          echo "total_cost=$TOTAL" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
+          echo "PR monthly cost: $TOTAL USD"
+
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "❌ Cost $TOTAL USD exceeds limit of $MAX_MONTHLY_COST_USD USD"
+            echo "❌ Cost exceeds allowed threshold"
             exit 1
           fi
 
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
+      # --------------------------------------------------
+      # Build Gemini Shadow Cost Prompt
+      # --------------------------------------------------
       - name: Build Gemini request
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
+          set -euo pipefail
+          INFRACOST_JSON=$(cat infracost.json)
+
           jq -n \
-            --argjson cost "$(cat infracost.json)" \
-            --arg total "${{ env.TOTAL }}" \
+            --arg total "$TOTAL" \
+            --arg infracost "$INFRACOST_JSON" \
             '{
               contents: [{
-                role: "user",
                 parts: [{
                   text: (
-                    "You are a FinOps Cloud Architect.\n\n" +
-                    "Analyze this Terraform cost.\n\n" +
-                    "Provide:\n" +
-                    "• Monthly cost summary\n" +
-                    "• Main cost drivers\n" +
-                    "• Optimization suggestions\n" +
-                    "• Risks before deployment\n\n" +
-                    "Total Monthly Cost: $" + $total + " USD\n\n" +
-                    "INFRACOST DATA:\n" + ($cost | tostring)
+"You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\n" +
+
+"Direct Monthly Cost (authoritative from Infracost): $" + $total + " USD.\n\n" +
+
+"Treat Infracost as source of truth for direct cost.\n" +
+"Additionally identify dependent usage-based billing triggers activated after deployment.\n" +
+"Be concise, precise, and technical. No generic advice.\n\n" +
+
+"For each detected component include:\n" +
+"- Direct cost summary (1 line)\n" +
+"- Dependent billing surfaces (component | billing unit | trigger | realistic price range)\n" +
+"- Concrete Terraform guardrail recommendation\n" +
+"- Risk rating (LOW / MEDIUM / HIGH)\n\n" +
+
+"Use 2026 pricing anchors when relevant:\n" +
+"Egress ~$0.12/GB | Inter-region ~$0.01-0.08/GB | NAT ~$0.045/hr + ~$0.045/GB |\n" +
+"Load Balancer ~$0.008-0.025/GB | Logging ~$0.50/GB |\n" +
+"Snapshots ~$0.026/GB | Static IP ~$0.004/hr\n\n" +
+
+"Infracost JSON:\n" + $infracost
                   )
                 }]
               }]
             }' > gemini_request.json
 
-      - name: Call Gemini API
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+      # --------------------------------------------------
+      # Call Gemini API
+      # --------------------------------------------------
+      - name: Call Gemini
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          curl -s \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+          set -euo pipefail
+
+          curl -sS \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
+            -H "X-goog-api-key: $GEMINI_API_KEY" \
+            -X POST \
             -d @gemini_request.json \
             | jq -r '.candidates[0].content.parts[0].text' \
             > gemini.md
 
-      - name: Comment PR cost + AI review
+      # --------------------------------------------------
+      # Comment on PR
+      # --------------------------------------------------
+      - name: Comment on PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: ${{ steps.tfroots.outputs.dir }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           {
-            echo "### 💰 Terraform PR Cost (Validated)"
-            echo "Directory: \`${{ steps.tfroots.outputs.dir }}\`"
-            echo "Estimated monthly cost: **$${{ env.TOTAL }} USD**"
+            echo "## Terraform PR FinOps Review"
+            echo ""
+            echo "**Directory:** ${{ steps.tfdir.outputs.dir }}"
+            echo ""
+            echo "**Estimated Monthly Cost:** $TOTAL USD"
+            echo ""
             echo "---"
-            echo "### 🤖 Gemini AI Cost & Architecture Review"
+            echo ""
             cat gemini.md
-          } > final_comment.md
-          gh pr comment ${{ github.event.pull_request.number }} --body-file final_comment.md
+          } > comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
