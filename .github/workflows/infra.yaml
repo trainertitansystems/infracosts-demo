@@ -35,6 +35,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq bc
+
       # --------------------------------------------------
       # Authenticate to Google Cloud
       # --------------------------------------------------
@@ -68,6 +69,7 @@ jobs:
             exit 1
           fi
           echo "dir=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+
       # --------------------------------------------------
       # Setup Terraform & Infracost
       # --------------------------------------------------
@@ -102,6 +104,7 @@ jobs:
             --path plan.json \
             --format json \
             --out-file infracost.json
+
       # --------------------------------------------------
       # Hard Monthly Cost Gate
       # --------------------------------------------------
@@ -118,47 +121,24 @@ jobs:
           fi
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
       # --------------------------------------------------
-      # Build Gemini Prompt (SAFE HEREDOC)
+      # Build Gemini Prompt
       # --------------------------------------------------
       - name: Build Gemini request
         working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           set -euo pipefail
           INFRACOST_JSON=$(cat infracost.json)
-          PROMPT=$(cat <<'EOF'
-          You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
-          
-          Direct Monthly Cost (authoritative from Infracost): $TOTAL USD.
-          
-          Treat Infracost as source of truth for direct cost.
-          Additionally identify dependent usage-based billing triggers activated after deployment.
-          Be concise, precise, and technical. No generic advice.
-          
-          For each detected component include:
-          - Direct cost summary (1 line)
-          - Dependent billing surfaces (component | billing unit | trigger | realistic price range)
-          - Concrete Terraform guardrail recommendation
-          - Risk rating (LOW / MEDIUM / HIGH)
-          
-          Use 2026 pricing anchors when relevant:
-          Egress ~$0.12/GB
-          Inter-region ~$0.01-0.08/GB
-          NAT ~$0.045/hr + ~$0.045/GB
-          Load Balancer ~$0.008-0.025/GB
-          Logging ~$0.50/GB
-          Snapshots ~$0.026/GB
-          Static IP ~$0.004/hr
-          
-          Infracost JSON:
-          $INFRACOST_JSON
+          cat > gemini_request.json <<EOF
+          {
+            "contents": [{
+              "parts": [{
+                "text": "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\nDirect Monthly Cost (authoritative from Infracost): ${TOTAL} USD.\n\nTreat Infracost as source of truth for direct cost.\nAdditionally identify dependent usage-based billing triggers activated after deployment.\nBe concise, precise, and technical. No generic advice.\n\nFor each detected component include:\n- Direct cost summary (1 line)\n- Dependent billing surfaces (component | billing unit | trigger | realistic price range)\n- Concrete Terraform guardrail recommendation\n- Risk rating (LOW / MEDIUM / HIGH)\n\nUse 2026 pricing anchors when relevant:\nEgress ~\$0.12/GB\nInter-region ~\$0.01-0.08/GB\nNAT ~\$0.045/hr + ~\$0.045/GB\nLoad Balancer ~\$0.008-0.025/GB\nLogging ~\$0.50/GB\nSnapshots ~\$0.026/GB\nStatic IP ~\$0.004/hr\n\nInfracost JSON:\n${INFRACOST_JSON}"
+              }]
+            }]
+          }
           EOF
-          )
-
-          jq -n \
-            --arg text "$PROMPT" \
-            '{ contents: [{ parts: [{ text: $text }] }] }' \
-            > gemini_request.json
 
       # --------------------------------------------------
       # Call Gemini API
@@ -177,6 +157,7 @@ jobs:
             -d @gemini_request.json \
             | jq -r '.candidates[0].content.parts[0].text' \
             > gemini.md
+
       # --------------------------------------------------
       # Comment on PR
       # --------------------------------------------------
