@@ -1,4 +1,4 @@
-name: Terraform PR Shadow Cost Governance
+name: Terraform PR Shadow Cost Governance (Gemini JSON + Validation)
 
 on:
   pull_request:
@@ -47,68 +47,147 @@ jobs:
       # -------------------------------------------------
       - name: Detect changed Terraform directories
         id: detect
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           git fetch origin main
 
           DIRS=$(git diff --name-only origin/main \
             | grep '\.tf$' \
-            | cut -d/ -f1 \
+            | awk -F/ '{print $1}' \
             | sort -u)
 
-          if [ -z "$DIRS" ]; then
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          if [ -z "${DIRS}" ]; then
+            echo "NO_CHANGES=true" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          echo "DIRS=$DIRS" >> $GITHUB_ENV
+          echo "DIRS=${DIRS}" >> "$GITHUB_ENV"
 
       # -------------------------------------------------
-      # Terraform Plan + Infracost
+      # Terraform Plan + Infracost + Grounding Extraction
       # -------------------------------------------------
-      - name: Run Terraform + Infracost
+      - name: Run Terraform + Infracost + Extract Grounding
         if: env.NO_CHANGES != 'true'
+        shell: bash
         run: |
-          set -e
-          echo "" > combined.md
-          echo "" > resources.txt
+          set -euo pipefail
+
+          : > combined.md
+          : > resources_types.txt
+          : > grounding.ndjson
 
           for DIR in $DIRS; do
             if [ -d "$DIR" ]; then
-              pushd "$DIR"
+              pushd "$DIR" >/dev/null
 
               terraform init -reconfigure -input=false
               terraform plan -refresh=true -out=tfplan.binary -input=false
               terraform show -json tfplan.binary > plan.json
 
-              # Extract resource types for grounding
-              jq -r '.resource_changes[].type' plan.json | sort -u >> ../resources.txt
+              # Extract resource types (for summary)
+              jq -r '.resource_changes[]?.type' plan.json | sort -u >> ../resources_types.txt
 
+              # Extract grounding (terraform_address/type/name + key attributes)
+              #
+              # key_attributes is intentionally filtered to keep prompt small:
+              # - Pulls "after" and selects a subset of common cost-driving fields if present.
+              # - If fields don't exist, they simply won't appear.
+              jq -c '
+                .resource_changes[]?
+                | select(.change.after != null)
+                | {
+                    terraform_address: .address,
+                    type: .type,
+                    name: .name,
+                    key_attributes: (
+                      .change.after
+                      | {
+                          region,
+                          location,
+                          zones,
+                          zone,
+                          project,
+                          network,
+                          subnetwork,
+                          ip_cidr_range,
+                          private_ip_google_access,
+                          enable_flow_logs,
+                          log_config,
+                          logging,
+                          enable_logging,
+                          target_tags,
+                          source_ranges,
+                          direction,
+                          priority,
+                          ports,
+                          protocol,
+                          allow,
+                          deny,
+                          purpose,
+                          role,
+                          tier,
+                          machine_type,
+                          min_instances,
+                          max_instances,
+                          disk_size_gb,
+                          disk_type,
+                          deletion_protection,
+                          ipv4_enabled,
+                          availability_type,
+                          edition,
+                          database_version,
+                          authorized_networks,
+                          require_ssl,
+                          enable_private_service_connect,
+                          enable_private_service_access,
+                          nat_ip_allocate_option,
+                          source_subnetwork_ip_ranges_to_nat
+                        }
+                      | with_entries(select(.value != null))
+                    )
+                  }
+              ' plan.json >> ../grounding.ndjson
+
+              # Infracost breakdown table
               infracost breakdown \
                 --path plan.json \
                 --format table \
                 --out-file infracost.md
 
-              popd
+              popd >/dev/null
 
-              echo "## 📦 $DIR" >> combined.md
+              echo "## 📦 ${DIR}" >> combined.md
               echo '```' >> combined.md
-              cat "$DIR/infracost.md" >> combined.md
+              cat "${DIR}/infracost.md" >> combined.md
               echo '```' >> combined.md
               echo "" >> combined.md
             fi
           done
 
+          # Consolidate grounding as JSON array
+          jq -s '.' grounding.ndjson > grounding.json
+
+          # Consolidate resource types
+          sort -u resources_types.txt > resources_types_uniq.txt
+
       # -------------------------------------------------
-      # Build Shadow Cost Gemini Request (Grounded)
+      # Build Gemini Request (Structured JSON Prompt)
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
+        shell: bash
         run: |
-          RESOURCE_TYPES=$(sort -u resources.txt | tr '\n' ',' | sed 's/,$//')
+          set -euo pipefail
 
+          RESOURCE_TYPES=$(tr '\n' ',' < resources_types_uniq.txt | sed 's/,$//')
+          GROUNDING=$(cat grounding.json)
+
+          # NOTE: We embed grounding + infracost markdown into the prompt.
+          # Gemini is required to output ONLY JSON.
           jq -n \
             --arg resources "$RESOURCE_TYPES" \
+            --arg grounding "$GROUNDING" \
             --rawfile infra combined.md \
             '{
               contents: [
@@ -116,43 +195,75 @@ jobs:
                   parts: [
                     {
                       text: (
-                        "You are a Principal FinOps Architect performing a \"Shadow Cost\" audit on a Google Cloud Terraform PR.\n\n" +
+"You are a Principal FinOps Architect performing a Shadow Cost Governance review of a Google Cloud Terraform Pull Request.\n\n" +
 
-                        "Detected Resource Types: " + $resources + "\n\n" +
+"You are given:\n" +
+"1) Authoritative direct cost baseline from Infracost.\n" +
+"2) Terraform plan grounding (resources with address/type and key attributes).\n\n" +
 
-                        "The Infracost output below is the authoritative baseline.\n" +
-                        "Do NOT contradict it.\n\n" +
+"Detected resource types (FYI): " + $resources + "\n\n" +
 
-                        "Your task is to model financial exposure created by these resources.\n\n" +
+"Terraform plan grounding JSON (treat as factual):\n" +
+$grounding + "\n\n" +
 
-                        "STRICT INSTRUCTIONS:\n" +
-                        "1. NEVER report $0.00 without explaining why and when billing begins.\n" +
-                        "2. If Infracost shows non-zero cost, treat it as confirmed primary cost.\n" +
-                        "3. For each resource include:\n" +
-                        "   - Primary Cost (Per Infracost)\n" +
-                        "   - Hidden / Indirect Triggers (Shadow Cost)\n" +
-                        "   - Risk Rating: LOW (Fixed), MEDIUM (Limited Variable), HIGH (Unbounded Scaling)\n\n" +
+"Infracost output (authoritative direct-cost baseline; do not contradict):\n\n" +
+$infra + "\n\n" +
 
-                        "4. Use realistic 2026 Google Cloud pricing ranges relevant to detected services.\n" +
-                        "   Dynamically infer billing dimensions such as:\n" +
-                        "   • Compute (vCPU-hour / vCPU-second)\n" +
-                        "   • Memory (GB-hour / GB-second)\n" +
-                        "   • Storage (GB-month)\n" +
-                        "   • Data transfer (per GB)\n" +
-                        "   • API calls / requests\n" +
-                        "   • Logging ingestion (per GB)\n" +
-                        "   • Data processing charges\n" +
-                        "   • Control-plane hourly charges\n\n" +
+"NON-NEGOTIABLE ENFORCEMENT RULES:\n" +
+"A) Direct cost handling:\n" +
+" - Infracost is authoritative for direct cost.\n" +
+" - If Infracost shows $0.00, still explain in recommendation when billing begins and what usage triggers it.\n" +
+" - Never contradict Infracost.\n\n" +
 
-                        "5. No documentation-style explanations.\n" +
-                        "6. No generic advice.\n\n" +
+"B) Indirect triggers (Shadow Costs):\n" +
+" - For EACH resource, provide at least THREE distinct indirect billing surfaces in indirect_triggers.\n" +
+" - Each trigger MUST include: surface, billing_unit, realistic price_range, when_billing_starts, why_this_resource_is_exposed.\n" +
+" - Do not repeat identical trigger wording across rows unless technically unavoidable; tailor conditions to the resource.\n" +
+" - If you believe fewer than 3 exist, you MUST still return 3 entries; for filler entries set surface=\"No additional distinct trigger\" and explain why.\n\n" +
 
-                        "OUTPUT FORMAT:\n" +
-                        "Return ONLY a Markdown table with these exact columns:\n\n" +
-                        "| Component | Primary Cost (Per Infracost) | Hidden / Indirect Triggers (Shadow Cost) | Risk Rating |\n\n" +
+"C) Output format rules:\n" +
+" - Output ONLY valid JSON. No markdown. No code fences.\n" +
+" - Top-level must be {\"resources\": [...] } and resources must be non-empty.\n" +
+" - No nulls, no empty strings.\n\n" +
 
-                        "Infracost Output:\n\n" +
-                        $infra
+"REQUIRED JSON SHAPE:\n" +
+"{\n" +
+"  \"resources\": [\n" +
+"    {\n" +
+"      \"resource_name\": \"string (prefer terraform_address)\",\n" +
+"      \"direct_cost\": {\n" +
+"        \"infracost_monthly_usd\": \"string like \\\"$0.00\\\"\",\n" +
+"        \"confidence\": \"EXACT|ESTIMATED\",\n" +
+"        \"notes\": \"string\"\n" +
+"      },\n" +
+"      \"indirect_triggers\": [\n" +
+"        {\n" +
+"          \"surface\": \"string\",\n" +
+"          \"price_range\": \"string\",\n" +
+"          \"billing_unit\": \"string\",\n" +
+"          \"when_billing_starts\": \"string\",\n" +
+"          \"why_this_resource_is_exposed\": \"string\"\n" +
+"        },\n" +
+"        {\"surface\":\"string\",\"price_range\":\"string\",\"billing_unit\":\"string\",\"when_billing_starts\":\"string\",\"why_this_resource_is_exposed\":\"string\"},\n" +
+"        {\"surface\":\"string\",\"price_range\":\"string\",\"billing_unit\":\"string\",\"when_billing_starts\":\"string\",\"why_this_resource_is_exposed\":\"string\"}\n" +
+"      ],\n" +
+"      \"actionable_recommendation\": {\n" +
+"        \"one_liner\": \"string\",\n" +
+"        \"terraform_change\": \"string\",\n" +
+"        \"finops_guardrail\": \"string\",\n" +
+"        \"verification_step\": \"string\"\n" +
+"      }\n" +
+"    }\n" +
+"  ]\n" +
+"}\n\n" +
+
+"QUALITY CHECK BEFORE OUTPUT:\n" +
+" - JSON parses\n" +
+" - resources array non-empty\n" +
+" - each resource has >= 3 indirect_triggers\n" +
+" - no empty fields\n\n" +
+
+"Now output the JSON.\n"
                       )
                     }
                   ]
@@ -161,16 +272,17 @@ jobs:
             }' > gemini_request.json
 
       # -------------------------------------------------
-      # Call Gemini API (Quota Safe)
+      # Call Gemini API (Attempt 1)
       # -------------------------------------------------
-      - name: Call Gemini API
+      - name: Call Gemini API (Attempt 1)
         if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        shell: bash
         run: |
-          set +e
+          set -euo pipefail
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
             -H "X-goog-api-key: $GEMINI_API_KEY" \
@@ -180,17 +292,214 @@ jobs:
           BODY=$(echo "$RESPONSE" | sed '$d')
           STATUS=$(echo "$RESPONSE" | tail -n1)
 
+          echo "$STATUS" > gemini_status.txt
+          echo "$BODY" > gemini_raw.json
+
           if [ "$STATUS" = "429" ]; then
-            echo "⚠️ Gemini quota exceeded. Shadow Cost analysis skipped." > gemini.md
+            echo "{\"error\":\"quota_exceeded\"}" > gemini_out.json
             exit 0
           fi
 
           if [ "$STATUS" != "200" ]; then
-            echo "⚠️ Gemini API error. Shadow Cost analysis skipped." > gemini.md
+            echo "{\"error\":\"gemini_api_error\",\"status\":$STATUS}" > gemini_out.json
             exit 0
           fi
 
-          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
+          # Extract model text (expected to be raw JSON)
+          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini_out.json
+
+      # -------------------------------------------------
+      # Validate Gemini JSON (Attempt 1)
+      # -------------------------------------------------
+      - name: Validate Gemini JSON (Attempt 1)
+        if: env.NO_CHANGES != 'true'
+        id: validate1
+        shell: bash
+        run: |
+          set +e
+
+          # Basic JSON parse
+          jq -e . gemini_out.json >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "VALID=false" >> "$GITHUB_OUTPUT"
+            echo "REASON=Invalid JSON" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Schema-ish checks
+          jq -e '
+            (.resources | type == "array") and
+            (.resources | length > 0) and
+            (all(.resources[]; (.resource_name | type=="string" and length>0))) and
+            (all(.resources[]; (.direct_cost.infracost_monthly_usd | type=="string" and length>0))) and
+            (all(.resources[]; (.indirect_triggers | type=="array" and length>=3))) and
+            (all(.resources[]; all(.indirect_triggers[]; (.surface|type=="string" and length>0) and (.billing_unit|type=="string" and length>0) and (.price_range|type=="string" and length>0) and (.when_billing_starts|type=="string" and length>0) and (.why_this_resource_is_exposed|type=="string" and length>0)))) and
+            (all(.resources[]; (.actionable_recommendation.one_liner|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.terraform_change|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.finops_guardrail|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.verification_step|type=="string" and length>0)))
+          ' gemini_out.json >/dev/null 2>&1
+
+          if [ $? -ne 0 ]; then
+            echo "VALID=false" >> "$GITHUB_OUTPUT"
+            echo "REASON=Schema/trigger-count violation (need >=3 triggers, no empty fields)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "VALID=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # -------------------------------------------------
+      # Retry: Build Repair Prompt + Call Gemini (Attempt 2)
+      # -------------------------------------------------
+      - name: Build Gemini Repair Request (Attempt 2)
+        if: env.NO_CHANGES != 'true' && steps.validate1.outputs.VALID != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Provide short failure guidance + original prompt payload again
+          # (This is intentionally concise: "regenerate and comply")
+          jq -n --rawfile orig gemini_request.json --arg reason "${{ steps.validate1.outputs.REASON }}" '
+            {
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: (
+"You violated the required output constraints.\n" +
+"Validation failure reason: " + $reason + "\n\n" +
+"Regenerate the response STRICTLY as valid JSON per the schema.\n" +
+"IMPORTANT: Every resource must have indirect_triggers length >= 3 and no empty fields.\n\n" +
+"Here is the original request payload for context (do not output it; only output the corrected JSON):\n\n" +
+$orig
+                      )
+                    }
+                  ]
+                }
+              ]
+            }
+          ' > gemini_repair_request.json
+
+      - name: Call Gemini API (Attempt 2)
+        if: env.NO_CHANGES != 'true' && steps.validate1.outputs.VALID != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+            -H "Content-Type: application/json" \
+            -H "X-goog-api-key: $GEMINI_API_KEY" \
+            -X POST \
+            -d @gemini_repair_request.json)
+
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          STATUS=$(echo "$RESPONSE" | tail -n1)
+
+          echo "$STATUS" > gemini_status_retry.txt
+          echo "$BODY" > gemini_raw_retry.json
+
+          if [ "$STATUS" = "429" ]; then
+            echo "{\"error\":\"quota_exceeded\"}" > gemini_out_retry.json
+            exit 0
+          fi
+
+          if [ "$STATUS" != "200" ]; then
+            echo "{\"error\":\"gemini_api_error\",\"status\":$STATUS}" > gemini_out_retry.json
+            exit 0
+          fi
+
+          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini_out_retry.json
+
+      - name: Validate Gemini JSON (Attempt 2)
+        if: env.NO_CHANGES != 'true' && steps.validate1.outputs.VALID != 'true'
+        id: validate2
+        shell: bash
+        run: |
+          set +e
+
+          jq -e . gemini_out_retry.json >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "VALID=false" >> "$GITHUB_OUTPUT"
+            echo "REASON=Invalid JSON after retry" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jq -e '
+            (.resources | type == "array") and
+            (.resources | length > 0) and
+            (all(.resources[]; (.resource_name | type=="string" and length>0))) and
+            (all(.resources[]; (.direct_cost.infracost_monthly_usd | type=="string" and length>0))) and
+            (all(.resources[]; (.indirect_triggers | type=="array" and length>=3))) and
+            (all(.resources[]; all(.indirect_triggers[]; (.surface|type=="string" and length>0) and (.billing_unit|type=="string" and length>0) and (.price_range|type=="string" and length>0) and (.when_billing_starts|type=="string" and length>0) and (.why_this_resource_is_exposed|type=="string" and length>0)))) and
+            (all(.resources[]; (.actionable_recommendation.one_liner|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.terraform_change|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.finops_guardrail|type=="string" and length>0))) and
+            (all(.resources[]; (.actionable_recommendation.verification_step|type=="string" and length>0)))
+          ' gemini_out_retry.json >/dev/null 2>&1
+
+          if [ $? -ne 0 ]; then
+            echo "VALID=false" >> "$GITHUB_OUTPUT"
+            echo "REASON=Schema/trigger-count violation after retry" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "VALID=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # -------------------------------------------------
+      # Render Markdown Table from JSON (Validated)
+      # -------------------------------------------------
+      - name: Render Shadow Cost Markdown
+        if: env.NO_CHANGES != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Choose the best available valid output
+          FINAL_JSON=""
+
+          if [ "${{ steps.validate1.outputs.VALID }}" = "true" ]; then
+            FINAL_JSON="gemini_out.json"
+          elif [ "${{ steps.validate2.outputs.VALID || 'false' }}" = "true" ]; then
+            FINAL_JSON="gemini_out_retry.json"
+          else
+            echo "⚠️ Gemini output invalid after retry; skipping shadow cost table." > gemini.md
+            exit 0
+          fi
+
+          # Convert JSON → Markdown table
+          {
+            echo "| Resource | Direct Cost (Infracost) | Indirect Triggers (≥3) | Actionable Recommendation |"
+            echo "|---|---:|---|---|"
+
+            jq -r '
+              .resources[]
+              | [
+                  .resource_name,
+                  (.direct_cost.infracost_monthly_usd + " (" + .direct_cost.confidence + ")"),
+                  (
+                    .indirect_triggers
+                    | map("• " + .surface + " — " + .price_range + " (" + .billing_unit + ") | Bills when: " + .when_billing_starts)
+                    | join("<br>")
+                  ),
+                  (
+                    "One-liner: " + .actionable_recommendation.one_liner + "<br>" +
+                    "Terraform: " + .actionable_recommendation.terraform_change + "<br>" +
+                    "Guardrail: " + .actionable_recommendation.finops_guardrail + "<br>" +
+                    "Verify: " + .actionable_recommendation.verification_step
+                  )
+                ]
+              | "| " + (.[0] | gsub("\\|"; "\\\\|")) +
+                " | " + (.[1] | gsub("\\|"; "\\\\|")) +
+                " | " + (.[2] | gsub("\\|"; "\\\\|")) +
+                " | " + (.[3] | gsub("\\|"; "\\\\|")) +
+                " |"
+            ' "$FINAL_JSON"
+          } > gemini.md
 
       # -------------------------------------------------
       # Post PR Comment
@@ -199,7 +508,10 @@ jobs:
         if: env.NO_CHANGES != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           {
             echo "## 💰 Terraform PR Cost Impact"
             echo ""
@@ -207,7 +519,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "## 🔎 Shadow Cost Financial Exposure Analysis"
+            echo "## 🔎 Shadow Cost Financial Exposure (Structured JSON → Validated Table)"
             echo ""
             cat gemini.md
           } > comment.md
