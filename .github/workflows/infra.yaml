@@ -15,8 +15,42 @@ env:
   MAX_MONTHLY_COST_USD: "50"
 
 jobs:
-  finops-gate:
+  detect-directories:
     runs-on: ubuntu-latest
+    outputs:
+      directories: ${{ steps.set-matrix.outputs.directories }}
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Terraform directories
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
+            | grep '\.tf$' \
+            | xargs -I {} dirname {} \
+            | sort -u \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          if [ "$CHANGED_DIRS" == "[]" ]; then
+            echo "❌ No Terraform changes detected."
+            exit 1
+          fi
+          
+          echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+          echo "Detected directories: $CHANGED_DIRS"
+
+  finops-gate:
+    needs: detect-directories
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.detect-directories.outputs.directories) }}
+      fail-fast: false
 
     steps:
 
@@ -47,30 +81,6 @@ jobs:
           create_credentials_file: true
 
       # --------------------------------------------------
-      # Detect Terraform directory changed in PR
-      # --------------------------------------------------
-      - name: Detect Terraform directory
-        id: tfdir
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
-            | grep '\.tf$' \
-            | xargs -I {} dirname {} \
-            | sort -u)
-          if [ -z "$CHANGED_DIRS" ]; then
-            echo "❌ No Terraform changes detected."
-            exit 1
-          fi
-          COUNT=$(echo "$CHANGED_DIRS" | wc -l | tr -d ' ')
-          if [ "$COUNT" -ne 1 ]; then
-            echo "❌ Exactly ONE Terraform directory must be modified per PR."
-            echo "$CHANGED_DIRS"
-            exit 1
-          fi
-          echo "dir=$CHANGED_DIRS" >> $GITHUB_OUTPUT
-
-      # --------------------------------------------------
       # Setup Terraform & Infracost
       # --------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
@@ -83,22 +93,22 @@ jobs:
       # Terraform Plan
       # --------------------------------------------------
       - name: Terraform Init
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: terraform plan -out=pr.tfplan -lock=false
 
       - name: Export Plan JSON
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: terraform show -json pr.tfplan > plan.json
 
       # --------------------------------------------------
       # Run Infracost
       # --------------------------------------------------
       - name: Run Infracost
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: |
           infracost breakdown \
             --path plan.json \
@@ -110,7 +120,7 @@ jobs:
       # --------------------------------------------------
       - name: Enforce monthly cost limit
         id: costgate
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: |
           set -euo pipefail
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
@@ -126,7 +136,7 @@ jobs:
       # Build Gemini Prompt
       # --------------------------------------------------
       - name: Build Gemini request
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: |
           set -euo pipefail
           
@@ -175,7 +185,7 @@ jobs:
       # Call Gemini API
       # --------------------------------------------------
       - name: Call Gemini
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -213,12 +223,12 @@ jobs:
       - name: Comment on PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: ${{ steps.tfdir.outputs.dir }}
+        working-directory: ${{ matrix.directory }}
         run: |
           {
-            echo "## Terraform PR FinOps Review"
+            echo "## Terraform PR FinOps Review - \`${{ matrix.directory }}\`"
             echo ""
-            echo "**Directory:** ${{ steps.tfdir.outputs.dir }}"
+            echo "**Directory:** ${{ matrix.directory }}"
             echo ""
             echo "**Estimated Monthly Cost:** $TOTAL USD"
             echo ""
