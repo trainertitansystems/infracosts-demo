@@ -1,4 +1,4 @@
-name: Terraform PR Cost Review (Dynamic + Intelligent AI)
+name: Terraform PR Cost Governance (Enterprise)
 
 on:
   pull_request:
@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       # -------------------------------------------------
-      # Setup Tools
+      # Setup Terraform & Infracost
       # -------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -35,7 +35,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Authenticate to GCP
+      - name: Authenticate to GCP (Terraform backend)
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
@@ -43,7 +43,7 @@ jobs:
           create_credentials_file: true
 
       # -------------------------------------------------
-      # Detect changed Terraform folders
+      # Detect changed Terraform directories dynamically
       # -------------------------------------------------
       - name: Detect changed Terraform directories
         id: detect
@@ -65,7 +65,7 @@ jobs:
           echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # Run Terraform + Infracost per changed folder
+      # Run Terraform Plan + Infracost per directory
       # -------------------------------------------------
       - name: Run Terraform + Infracost
         if: env.NO_CHANGES != 'true'
@@ -100,7 +100,7 @@ jobs:
           done
 
       # -------------------------------------------------
-      # Build Intelligent Gemini Request
+      # Build Enterprise FinOps Governance Prompt
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
@@ -113,20 +113,31 @@ jobs:
                   parts: [
                     {
                       text: (
-                        "You are a senior FinOps Cloud Architect.\n\n" +
+                        "You are a Principal FinOps Architect reviewing a production-bound Terraform PR in Google Cloud.\n\n" +
 
-                        "Respond in under 150 words.\n" +
-                        "No filler text.\n" +
-                        "No generic monitoring advice.\n" +
-                        "Be technically precise.\n\n" +
+                        "This is a cost governance decision analysis.\n" +
+                        "Engineers will act based on this output.\n\n" +
 
-                        "For each resource:\n" +
-                        "- State whether it is free or billable.\n" +
-                        "- Explain its pricing model (hourly, per GB, per request, etc).\n" +
-                        "- Identify real cost drivers.\n" +
-                        "- Explain when cost would be triggered.\n\n" +
+                        "Analyze resources dynamically and infer pricing models from resource types.\n\n" +
 
-                        "Do NOT repeat the Infracost table.\n\n" +
+                        "STRICT OUTPUT FORMAT (use only these sections):\n\n" +
+                        "• Pricing Model\n" +
+                        "• Cost Structure (Fixed vs Variable)\n" +
+                        "• Scaling Sensitivity\n" +
+                        "• Hidden / Indirect Cost Surfaces\n" +
+                        "• Cost Risk Level (LOW / MEDIUM / HIGH)\n" +
+                        "• Deployment Recommendation (APPROVE / REVIEW / ESCALATE)\n\n" +
+
+                        "Rules:\n" +
+                        "- Assume Google Cloud.\n" +
+                        "- Do not assume a specific service type.\n" +
+                        "- Infer billing dimensions implicitly from service design.\n" +
+                        "- Distinguish control-plane vs workload/data-plane pricing when applicable.\n" +
+                        "- If cost is $0, explain when it becomes billable.\n" +
+                        "- Identify scaling multipliers or amplification factors.\n" +
+                        "- Be concise (max 170 words).\n" +
+                        "- No generic advice.\n\n" +
+
                         "Terraform PR cost output:\n\n" +
                         $infra
                       )
@@ -171,7 +182,7 @@ jobs:
           echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
 
       # -------------------------------------------------
-      # Comment PR
+      # Post PR Comment
       # -------------------------------------------------
       - name: Comment PR
         if: env.NO_CHANGES != 'true'
@@ -185,7 +196,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "## 🤖 Gemini Review"
+            echo "## 🤖 FinOps Governance Analysis"
             echo ""
             cat gemini.md
           } > comment.md
