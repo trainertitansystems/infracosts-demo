@@ -50,27 +50,27 @@ jobs:
         run: |
           git fetch origin main
 
-          CHANGED_DIRS=$(git diff --name-only origin/main \
+          DIRS=$(git diff --name-only origin/main \
             | grep '\.tf$' \
             | cut -d/ -f1 \
             | sort -u)
 
-          echo "Detected folders:"
-          echo "$CHANGED_DIRS"
-
-          if [ -z "$CHANGED_DIRS" ]; then
+          if [ -z "$DIRS" ]; then
             echo "No Terraform changes detected."
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
             exit 0
           fi
 
-          echo "DIRS<<EOF" >> $GITHUB_ENV
-          echo "$CHANGED_DIRS" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          echo "Detected directories:"
+          echo "$DIRS"
+
+          echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
       # Run Terraform + Infracost per folder
       # -------------------------------------------------
       - name: Run Terraform + Infracost
+        if: env.NO_CHANGES != 'true'
         run: |
           echo "" > combined.md
 
@@ -78,7 +78,7 @@ jobs:
             if [ -d "$DIR" ]; then
               echo "Processing $DIR"
 
-              cd $DIR
+              pushd "$DIR"
 
               terraform init -reconfigure -input=false
               terraform plan -refresh=true -out=tfplan.binary -input=false
@@ -89,21 +89,22 @@ jobs:
                 --format table \
                 --out-file infracost.md
 
-              echo "## 📦 $DIR" >> ../combined.md
-              echo "" >> ../combined.md
-              echo '```' >> ../combined.md
-              cat infracost.md >> ../combined.md
-              echo '```' >> ../combined.md
-              echo "" >> ../combined.md
+              popd
 
-              cd ..
+              echo "## 📦 $DIR" >> combined.md
+              echo "" >> combined.md
+              echo '```' >> combined.md
+              cat "$DIR/infracost.md" >> combined.md
+              echo '```' >> combined.md
+              echo "" >> combined.md
             fi
           done
 
       # -------------------------------------------------
-      # Gemini Analysis (PR Plan Only)
+      # Build Gemini Request
       # -------------------------------------------------
       - name: Build Gemini Request
+        if: env.NO_CHANGES != 'true'
         run: |
           jq -n \
             --rawfile infra combined.md \
@@ -112,41 +113,46 @@ jobs:
                 role: "user",
                 parts: [{
                   text: (
-                    "Analyze ONLY the Terraform changes introduced in this PR.\n\n" +
+                    "You are a FinOps and Cloud Architecture expert.\n\n" +
+                    "Analyze ONLY the Terraform changes introduced in this PR.\n" +
+                    "Even if cost is $0, provide architecture and optimization feedback.\n\n" +
                     $infra
                   )
                 }]
               }]
             }' > gemini_request.json
 
+      # -------------------------------------------------
+      # Call Gemini API (Safe Version)
+      # -------------------------------------------------
       - name: Call Gemini API
+        if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          curl -s \
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini_request.json \
-            | jq -r '.candidates[0].content.parts[0].text' \
-            > gemini.md
+            -d @gemini_request.json)
 
-      # -------------------------------------------------
-      # Comment PR
-      # -------------------------------------------------
-      - name: Comment PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          {
-            echo "## 💰 Terraform PR Cost Impact"
-            echo ""
-            cat combined.md
-            echo ""
-            echo "---"
-            echo ""
-            echo "## 🤖 Gemini Review"
-            cat gemini.md
-          } > comment.md
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          STATUS=$(echo "$RESPONSE" | tail -n 1)
 
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body-file comment.md
+          echo "Gemini HTTP Status: $STATUS"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Gemini API error:"
+            echo "$BODY"
+            echo "Gemini API failed. See workflow logs." > gemini.md
+          else
+            TEXT=$(echo "$BODY" | jq -r '
+              if (.candidates | length) > 0 then
+                .candidates[0].content.parts[0].text
+              else
+                empty
+              end
+            ')
+
+            if [ -z "$TEXT" ]; then
+              echo "Gemini returned no analysis." > gemini.md
+            else
