@@ -1,4 +1,4 @@
-name: Terraform PR Cost Governance (Grounded Enterprise)
+name: Terraform PR Shadow Cost Governance
 
 on:
   pull_request:
@@ -81,11 +81,8 @@ jobs:
               terraform plan -refresh=true -out=tfplan.binary -input=false
               terraform show -json tfplan.binary > plan.json
 
-              # Extract resource types
+              # Extract resource types for grounding
               jq -r '.resource_changes[].type' plan.json | sort -u >> ../resources.txt
-
-              # Extract region if available
-              jq -r '..|.region? // empty' plan.json | sort -u >> ../region.txt || true
 
               infracost breakdown \
                 --path plan.json \
@@ -103,17 +100,15 @@ jobs:
           done
 
       # -------------------------------------------------
-      # Build Grounded Gemini Request
+      # Build Shadow Cost Gemini Request (Grounded)
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
         run: |
           RESOURCE_TYPES=$(sort -u resources.txt | tr '\n' ',' | sed 's/,$//')
-          REGION=$(sort -u region.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
 
           jq -n \
             --arg resources "$RESOURCE_TYPES" \
-            --arg region "$REGION" \
             --rawfile infra combined.md \
             '{
               contents: [
@@ -121,25 +116,42 @@ jobs:
                   parts: [
                     {
                       text: (
-                        "You are a Principal FinOps Architect reviewing a Google Cloud Terraform PR.\n\n" +
+                        "You are a Principal FinOps Architect performing a \"Shadow Cost\" audit on a Google Cloud Terraform PR.\n\n" +
 
-                        "Detected Resource Types: " + $resources + "\n" +
-                        "Detected Region(s): " + $region + "\n\n" +
+                        "Detected Resource Types: " + $resources + "\n\n" +
 
-                        "Provide quantitative cost governance analysis.\n\n" +
+                        "The Infracost output below is the authoritative baseline.\n" +
+                        "Do NOT contradict it.\n\n" +
 
-                        "Return ONLY a Markdown table with columns:\n" +
-                        "| Component | Pricing Mechanism | Typical GCP Cost Range (USD) | Cost Trigger | Risk Level |\n\n" +
+                        "Your task is to model financial exposure created by these resources.\n\n" +
 
-                        "Requirements:\n" +
-                        "- Assume Google Cloud.\n" +
-                        "- Use realistic pricing ranges in USD.\n" +
-                        "- Identify billing dimensions.\n" +
-                        "- Identify scaling multipliers.\n" +
-                        "- If currently $0, explain trigger condition.\n" +
-                        "- No generic advice.\n\n" +
+                        "STRICT INSTRUCTIONS:\n" +
+                        "1. NEVER report $0.00 without explaining why and when billing begins.\n" +
+                        "2. If Infracost shows non-zero cost, treat it as confirmed primary cost.\n" +
+                        "3. For each resource include:\n" +
+                        "   - Primary Cost (Per Infracost)\n" +
+                        "   - Hidden / Indirect Triggers (Shadow Cost)\n" +
+                        "   - Risk Rating: LOW (Fixed), MEDIUM (Limited Variable), HIGH (Unbounded Scaling)\n\n" +
 
-                        "Infracost Summary:\n\n" +
+                        "4. Use realistic 2026 Google Cloud pricing ranges relevant to detected services.\n" +
+                        "   Dynamically infer billing dimensions such as:\n" +
+                        "   • Compute (vCPU-hour / vCPU-second)\n" +
+                        "   • Memory (GB-hour / GB-second)\n" +
+                        "   • Storage (GB-month)\n" +
+                        "   • Data transfer (per GB)\n" +
+                        "   • API calls / requests\n" +
+                        "   • Logging ingestion (per GB)\n" +
+                        "   • Data processing charges\n" +
+                        "   • Control-plane hourly charges\n\n" +
+
+                        "5. No documentation-style explanations.\n" +
+                        "6. No generic advice.\n\n" +
+
+                        "OUTPUT FORMAT:\n" +
+                        "Return ONLY a Markdown table with these exact columns:\n\n" +
+                        "| Component | Primary Cost (Per Infracost) | Hidden / Indirect Triggers (Shadow Cost) | Risk Rating |\n\n" +
+
+                        "Infracost Output:\n\n" +
                         $infra
                       )
                     }
@@ -169,19 +181,19 @@ jobs:
           STATUS=$(echo "$RESPONSE" | tail -n1)
 
           if [ "$STATUS" = "429" ]; then
-            echo "⚠️ Gemini quota exceeded. AI review skipped." > gemini.md
+            echo "⚠️ Gemini quota exceeded. Shadow Cost analysis skipped." > gemini.md
             exit 0
           fi
 
           if [ "$STATUS" != "200" ]; then
-            echo "⚠️ Gemini API error. AI review skipped." > gemini.md
+            echo "⚠️ Gemini API error. Shadow Cost analysis skipped." > gemini.md
             exit 0
           fi
 
           echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
 
       # -------------------------------------------------
-      # Comment on PR
+      # Post PR Comment
       # -------------------------------------------------
       - name: Comment PR
         if: env.NO_CHANGES != 'true'
@@ -195,7 +207,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "## 🤖 FinOps Quantitative Analysis"
+            echo "## 🔎 Shadow Cost Financial Exposure Analysis"
             echo ""
             cat gemini.md
           } > comment.md
