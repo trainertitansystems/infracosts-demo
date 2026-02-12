@@ -1,4 +1,4 @@
-name: Terraform PR Cost Review (Dynamic)
+name: Terraform PR Cost Review (Dynamic + Intelligent AI)
 
 on:
   pull_request:
@@ -65,7 +65,7 @@ jobs:
           echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # Run Terraform + Infracost per folder
+      # Run Terraform + Infracost per changed folder
       # -------------------------------------------------
       - name: Run Terraform + Infracost
         if: env.NO_CHANGES != 'true'
@@ -100,7 +100,7 @@ jobs:
           done
 
       # -------------------------------------------------
-      # Build Gemini Request (exact API format)
+      # Build Intelligent Gemini Request
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
@@ -113,11 +113,21 @@ jobs:
                   parts: [
                     {
                       text: (
-                        "Analyze ONLY the Terraform changes introduced in this PR.\n\n" +
-                        "Provide:\n" +
-                        "- Cost summary\n" +
-                        "- Optimization suggestions\n" +
-                        "- Risk observations\n\n" +
+                        "You are a senior FinOps Cloud Architect.\n\n" +
+
+                        "Respond in under 150 words.\n" +
+                        "No filler text.\n" +
+                        "No generic monitoring advice.\n" +
+                        "Be technically precise.\n\n" +
+
+                        "For each resource:\n" +
+                        "- State whether it is free or billable.\n" +
+                        "- Explain its pricing model (hourly, per GB, per request, etc).\n" +
+                        "- Identify real cost drivers.\n" +
+                        "- Explain when cost would be triggered.\n\n" +
+
+                        "Do NOT repeat the Infracost table.\n\n" +
+                        "Terraform PR cost output:\n\n" +
                         $infra
                       )
                     }
@@ -127,7 +137,7 @@ jobs:
             }' > gemini_request.json
 
       # -------------------------------------------------
-      # Call Gemini API (Your Working Curl Style)
+      # Call Gemini API (Quota Safe)
       # -------------------------------------------------
       - name: Call Gemini API
         if: env.NO_CHANGES != 'true'
@@ -149,13 +159,12 @@ jobs:
           echo "Gemini HTTP Status: $STATUS"
 
           if [ "$STATUS" = "429" ]; then
-            echo "Gemini quota exceeded. Skipping AI analysis." > gemini.md
+            echo "⚠️ Gemini quota exceeded. AI review skipped." > gemini.md
             exit 0
           fi
 
           if [ "$STATUS" != "200" ]; then
-            echo "Gemini API failed:" > gemini.md
-            echo "$BODY" >> gemini.md
+            echo "⚠️ Gemini API error. AI review skipped." > gemini.md
             exit 0
           fi
 
