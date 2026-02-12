@@ -67,11 +67,12 @@ jobs:
           echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # Run Terraform + Infracost per folder
+      # Run Terraform + Infracost per changed folder
       # -------------------------------------------------
       - name: Run Terraform + Infracost
         if: env.NO_CHANGES != 'true'
         run: |
+          set -e
           echo "" > combined.md
 
           for DIR in $DIRS; do
@@ -115,7 +116,7 @@ jobs:
                   text: (
                     "You are a FinOps and Cloud Architecture expert.\n\n" +
                     "Analyze ONLY the Terraform changes introduced in this PR.\n" +
-                    "Even if cost is $0, provide architecture and optimization feedback.\n\n" +
+                    "Even if cost impact is $0, provide architecture, security, and optimization feedback.\n\n" +
                     $infra
                   )
                 }]
@@ -123,36 +124,52 @@ jobs:
             }' > gemini_request.json
 
       # -------------------------------------------------
-      # Call Gemini API (Safe Version)
+      # Call Gemini API (Stable + Safe)
       # -------------------------------------------------
       - name: Call Gemini API
         if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          set -e
+
           RESPONSE=$(curl -s -w "\n%{http_code}" \
-            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
+            "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @gemini_request.json)
 
-          BODY=$(echo "$RESPONSE" | head -n -1)
-          STATUS=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          STATUS=$(echo "$RESPONSE" | tail -n1)
 
           echo "Gemini HTTP Status: $STATUS"
 
           if [ "$STATUS" != "200" ]; then
-            echo "Gemini API error:"
+            echo "Gemini API failed:"
             echo "$BODY"
             echo "Gemini API failed. See workflow logs." > gemini.md
           else
-            TEXT=$(echo "$BODY" | jq -r '
-              if (.candidates | length) > 0 then
-                .candidates[0].content.parts[0].text
-              else
-                empty
-              end
-            ')
+            echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
+          fi
 
-            if [ -z "$TEXT" ]; then
-              echo "Gemini returned no analysis." > gemini.md
-            else
+      # -------------------------------------------------
+      # Comment PR
+      # -------------------------------------------------
+      - name: Comment PR
+        if: env.NO_CHANGES != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 💰 Terraform PR Cost Impact"
+            echo ""
+            cat combined.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🤖 Gemini Review"
+            echo ""
+            cat gemini.md
+          } > comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file comment.md
