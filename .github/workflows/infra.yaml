@@ -35,7 +35,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Authenticate to GCP (for Terraform backend)
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
@@ -62,13 +62,10 @@ jobs:
             exit 0
           fi
 
-          echo "Detected directories:"
-          echo "$DIRS"
-
           echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # Run Terraform + Infracost per changed folder
+      # Run Terraform + Infracost per folder
       # -------------------------------------------------
       - name: Run Terraform + Infracost
         if: env.NO_CHANGES != 'true'
@@ -103,7 +100,7 @@ jobs:
           done
 
       # -------------------------------------------------
-      # Build Gemini Request
+      # Build Gemini Request (exact API format)
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
@@ -111,27 +108,33 @@ jobs:
           jq -n \
             --rawfile infra combined.md \
             '{
-              contents: [{
-                parts: [{
-                  text: (
-                    "You are a FinOps and Cloud Architecture expert.\n\n" +
-                    "Analyze ONLY the Terraform changes introduced in this PR.\n" +
-                    "Even if cost impact is $0, provide architecture, security, and optimization feedback.\n\n" +
-                    $infra
-                  )
-                }]
-              }]
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: (
+                        "Analyze ONLY the Terraform changes introduced in this PR.\n\n" +
+                        "Provide:\n" +
+                        "- Cost summary\n" +
+                        "- Optimization suggestions\n" +
+                        "- Risk observations\n\n" +
+                        $infra
+                      )
+                    }
+                  ]
+                }
+              ]
             }' > gemini_request.json
 
       # -------------------------------------------------
-      # Call Gemini API (WORKING VERSION)
+      # Call Gemini API (Your Working Curl Style)
       # -------------------------------------------------
       - name: Call Gemini API
         if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          set -e
+          set +e
 
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
@@ -145,11 +148,15 @@ jobs:
 
           echo "Gemini HTTP Status: $STATUS"
 
+          if [ "$STATUS" = "429" ]; then
+            echo "Gemini quota exceeded. Skipping AI analysis." > gemini.md
+            exit 0
+          fi
+
           if [ "$STATUS" != "200" ]; then
-            echo "Gemini API failed:"
-            echo "$BODY"
-            echo "Gemini API failed. See workflow logs." > gemini.md
-            exit 1
+            echo "Gemini API failed:" > gemini.md
+            echo "$BODY" >> gemini.md
+            exit 0
           fi
 
           echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
