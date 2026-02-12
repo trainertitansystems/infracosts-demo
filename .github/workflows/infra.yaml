@@ -29,20 +29,22 @@ jobs:
         id: set-matrix
         run: |
           set -euo pipefail
-          git fetch origin main
-          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
+          
+          # Get files changed in the latest commit only
+          CHANGED_DIRS=$(git diff-tree --no-commit-id --name-only -r HEAD \
             | grep '\.tf$' \
             | xargs -I {} dirname {} \
             | sort -u \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
-          if [ "$CHANGED_DIRS" == "[]" ]; then
-            echo "❌ No Terraform changes detected."
+          if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
+            echo "❌ No Terraform changes detected in the latest commit."
             exit 1
           fi
           
           echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
-          echo "Detected directories: $CHANGED_DIRS"
+          echo "✅ Detected Terraform directories in latest commit:"
+          echo "$CHANGED_DIRS" | jq -r '.[]'
 
   finops-gate:
     needs: detect-directories
