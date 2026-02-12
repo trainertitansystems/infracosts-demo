@@ -15,23 +15,23 @@ env:
   MAX_MONTHLY_COST_USD: "50"
 
 jobs:
-  finops:
+  finops-gate:
     runs-on: ubuntu-latest
 
     steps:
 
-    # ---------------------------------------------
+    # ------------------------------------------
     # Checkout PR
-    # ---------------------------------------------
+    # ------------------------------------------
     - name: Checkout PR branch
       uses: actions/checkout@v4
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0
 
-    # ---------------------------------------------
-    # Authenticate to GCP (Workload Identity)
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Authenticate to GCP
+    # ------------------------------------------
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
@@ -39,19 +39,19 @@ jobs:
         service_account: github-terraform@siem-486017.iam.gserviceaccount.com
         create_credentials_file: true
 
-    # ---------------------------------------------
-    # Install bc for numeric comparison
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Install bc
+    # ------------------------------------------
     - name: Install bc
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq bc
 
-    # ---------------------------------------------
-    # Detect Terraform directory from PR diff
-    # ---------------------------------------------
-    - name: Detect Terraform directory
-      id: tfdir
+    # ------------------------------------------
+    # Detect Terraform root (PR diff only)
+    # ------------------------------------------
+    - name: Detect Terraform root
+      id: tfroot
       run: |
         set -euo pipefail
         git fetch origin main
@@ -75,46 +75,46 @@ jobs:
 
         echo "dir=$DIRS" >> "$GITHUB_OUTPUT"
 
-    # ---------------------------------------------
-    # Setup Terraform and Infracost
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Setup Terraform + Infracost
+    # ------------------------------------------
     - uses: hashicorp/setup-terraform@v3
 
     - uses: infracost/actions/setup@v3
       with:
         api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-    # ---------------------------------------------
+    # ------------------------------------------
     # Terraform Plan
-    # ---------------------------------------------
+    # ------------------------------------------
     - name: Terraform Init
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: terraform init -input=false -lock=false
 
     - name: Terraform Plan
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: terraform plan -out=pr.tfplan -lock=false
 
     - name: Export Plan JSON
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: terraform show -json pr.tfplan > plan.json
 
-    # ---------------------------------------------
+    # ------------------------------------------
     # Infracost
-    # ---------------------------------------------
+    # ------------------------------------------
     - name: Run Infracost
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
         infracost breakdown \
           --path plan.json \
           --format json \
           --out-file infracost.json
 
-    # ---------------------------------------------
+    # ------------------------------------------
     # Hard Cost Gate
-    # ---------------------------------------------
+    # ------------------------------------------
     - name: Enforce cost limit
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
         set -euo pipefail
         TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
@@ -128,11 +128,11 @@ jobs:
 
         echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-    # ---------------------------------------------
-    # Build Gemini Request (Shadow Cost Mode)
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Build Gemini request
+    # ------------------------------------------
     - name: Build Gemini request
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
         set -euo pipefail
         INFRACOST_JSON=$(cat infracost.json)
@@ -144,40 +144,25 @@ jobs:
             contents: [{
               parts: [{
                 text: (
-"You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\n" +
-
-"Direct monthly cost from Infracost: $" + $total + " USD.\n\n" +
-
-"Treat Infracost as authoritative for direct cost.\n" +
-"Additionally identify dependent usage-based billing triggers.\n" +
-"Be concise and precise (max 180 words).\n\n" +
-
-"For each detected component include:\n" +
-"- Direct cost summary\n" +
-"- Dependent billing surfaces (component | billing unit | trigger | price range)\n" +
-"- Terraform guardrail recommendation\n" +
-"- Risk rating (LOW/MEDIUM/HIGH)\n\n" +
-
-"Use 2026 reference anchors when relevant:\n" +
-"Egress ~$0.12/GB, Inter-region ~$0.01-0.08/GB, NAT ~$0.045/hr + ~$0.045/GB,\n" +
-"LB ~$0.008-0.025/GB, Logging ~$0.50/GB, Snapshots ~$0.026/GB, Static IP ~$0.004/hr.\n\n" +
-
+"You are a Principal FinOps Architect.\n\n" +
+"Direct cost from Infracost: $" + $total + " USD.\n\n" +
+"Identify dependent usage-based billing triggers.\n" +
+"Be concise and technical.\n\n" +
 "Infracost JSON:\n" + $infracost
                 )
               }]
             }]
           }' > gemini_request.json
 
-    # ---------------------------------------------
-    # Call Gemini API
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Call Gemini
+    # ------------------------------------------
     - name: Call Gemini
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         set -euo pipefail
-
         curl -sS \
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
           -H "Content-Type: application/json" \
@@ -187,24 +172,24 @@ jobs:
           | jq -r '.candidates[0].content.parts[0].text' \
           > gemini.md
 
-    # ---------------------------------------------
-    # Comment on PR
-    # ---------------------------------------------
+    # ------------------------------------------
+    # Comment on PR (SAFE)
+    # ------------------------------------------
     - name: Comment on PR
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      working-directory: ${{ steps.tfdir.outputs.dir }}
+      working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
         {
           echo "## Terraform PR FinOps Review"
           echo ""
-          echo "**Directory:** ${{ steps.tfdir.outputs.dir }}"
+          echo "Directory: ${{ steps.tfroot.outputs.dir }}"
           echo ""
-          echo "**Estimated Monthly Cost:** $TOTAL USD"
+          echo "Estimated Monthly Cost: $TOTAL USD"
           echo ""
           echo "---"
           echo ""
           cat gemini.md
-        } > pr_comment.md
+        } > comment.md
 
-        gh pr comment ${{ github.event.pull_request.number }} --body-file pr_comment.md
+        gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
