@@ -40,9 +40,9 @@ jobs:
         create_credentials_file: true
 
     # =====================================================
-    # Install bc (required for numeric comparison)
+    # Install required dependency
     # =====================================================
-    - name: Install dependencies
+    - name: Install bc
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq bc
@@ -100,7 +100,7 @@ jobs:
       run: terraform show -json pr.tfplan > plan.json
 
     # =====================================================
-    # Run Infracost
+    # Infracost Breakdown
     # =====================================================
     - name: Run Infracost
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -111,11 +111,12 @@ jobs:
           --out-file infracost.json
 
     # =====================================================
-    # HARD COST GATE
+    # Hard Cost Gate
     # =====================================================
     - name: Enforce monthly cost limit
       working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
+        set -euo pipefail
         TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
         echo "PR monthly cost: $TOTAL USD"
@@ -128,7 +129,7 @@ jobs:
         echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
     # =====================================================
-    # Build Gemini Shadow Cost Request (Crisp + Dependent-aware)
+    # Build Gemini Request (Crisp Shadow Cost Mode)
     # =====================================================
     - name: Build Gemini request
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -145,19 +146,19 @@ jobs:
                 text: (
 "You are a Principal FinOps Architect performing a Shadow Cost audit.\n\n" +
 
-"Direct cost (authoritative from Infracost): $" + $total + " USD\n\n" +
+"Direct cost from Infracost: $" + $total + " USD.\n\n" +
 
-"Use Infracost as truth for direct recurring cost.\n" +
-"Additionally enumerate dependent/usage-based services triggered AFTER deployment.\n" +
-"Be crisp. Max 180 words. No generic advice.\n\n" +
+"Use Infracost as authoritative direct cost.\n" +
+"Additionally identify dependent/usage-based billing surfaces triggered after deployment.\n" +
+"Be concise. Max 180 words. No generic advice.\n\n" +
 
-"For each detected component provide:\n" +
+"For each component include:\n" +
 "- Direct cost summary (1 sentence)\n" +
 "- Dependent billing surfaces (component — billing unit — trigger — price range)\n" +
 "- Concrete Terraform guardrail\n" +
 "- Risk rating (LOW/MEDIUM/HIGH)\n\n" +
 
-"Use 2026 anchors where relevant:\n" +
+"Use 2026 pricing anchors when relevant:\n" +
 "Egress ~$0.12/GB | Inter-region ~$0.01–0.08/GB | NAT ~$0.045/hr + ~$0.045/GB | " +
 "LB ~$0.008–0.025/GB | Logging ~$0.50/GB | Snapshots ~$0.026/GB | Static IP ~$0.004/hr\n\n" +
 
@@ -168,13 +169,14 @@ jobs:
           }' > gemini_request.json
 
     # =====================================================
-    # Call Gemini
+    # Call Gemini API
     # =====================================================
     - name: Call Gemini API
       working-directory: ${{ steps.tfroot.outputs.dir }}
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
+        set -euo pipefail
         curl -sS \
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
           -H "Content-Type: application/json" \
@@ -185,7 +187,7 @@ jobs:
           > gemini.md
 
     # =====================================================
-    # PR Comment (Safe)
+    # Comment on PR (Safe YAML)
     # =====================================================
     - name: Comment PR
       env:
