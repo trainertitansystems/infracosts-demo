@@ -1,4 +1,4 @@
-name: Terraform PR FinOps Gate (Validated + Strict Table)
+name: Terraform PR FinOps Gate (Validated + Gemini)
 
 on:
   pull_request:
@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     # =====================================================
     # Checkout PR HEAD
     # =====================================================
@@ -39,7 +40,7 @@ jobs:
         create_credentials_file: true
 
     # =====================================================
-    # Detect Terraform root from PR diff ONLY
+    # Detect Terraform root (PR diff only)
     # =====================================================
     - name: Detect Terraform root
       id: tfroot
@@ -58,7 +59,7 @@ jobs:
         echo "$ROOTS"
 
         if [ -z "$ROOTS" ]; then
-          echo "No Terraform changes."
+          echo "No Terraform changes detected."
           exit 1
         fi
 
@@ -105,7 +106,7 @@ jobs:
           --out-file infracost.json
 
     # =====================================================
-    # Hard Cost Gate
+    # HARD COST GATE
     # =====================================================
     - name: Enforce monthly cost limit
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -126,7 +127,7 @@ jobs:
         echo "✅ Cost within allowed limit"
 
     # =====================================================
-    # Build Strict Table Gemini Request
+    # Build Gemini Request
     # =====================================================
     - name: Build Gemini request
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -138,22 +139,13 @@ jobs:
             contents: [{
               parts: [{
                 text:
-"You are a Principal FinOps Architect.\n\n" +
-
-"The Infracost JSON below is authoritative for direct cost. Do NOT contradict it.\n\n" +
-
-"STRICT OUTPUT REQUIREMENTS:\n" +
-"1. Output MUST be a Markdown table.\n" +
-"2. Output ONLY the table.\n" +
-"3. No explanations outside the table.\n" +
-"4. Each resource must have one row.\n" +
-"5. Each row must include at least THREE indirect billing surfaces.\n" +
-"6. No empty cells.\n\n" +
-
-"TABLE FORMAT:\n\n" +
-"| Resource | Direct Cost (Per Infracost) | Indirect Billing Surfaces (≥3 with price range + billing unit + trigger condition) | Risk Rating |\n" +
-"|---|---:|---|---|\n\n" +
-
+"You are a FinOps Cloud Architect.\n\n" +
+"Analyze this Terraform PR cost.\n\n" +
+"Provide:\n" +
+"- Monthly cost summary\n" +
+"- Main cost drivers\n" +
+"- Optimization suggestions\n" +
+"- Deployment risks\n\n" +
 "Total Monthly Cost: $" + $total + " USD\n\n" +
 "Infracost JSON:\n" + $infra
               }]
@@ -190,11 +182,11 @@ jobs:
           echo ""
           echo "Directory: \`${{ steps.tfroot.outputs.dir }}\`"
           echo ""
-          echo "Estimated Monthly Cost: **\$${TOTAL} USD**"
+          echo "Estimated monthly cost: **\$${TOTAL} USD**"
           echo ""
           echo "---"
           echo ""
-          echo "## 🔎 Shadow Cost Analysis"
+          echo "## 🤖 Gemini AI Cost & Architecture Review"
           echo ""
           cat gemini.md
         } > comment.md
