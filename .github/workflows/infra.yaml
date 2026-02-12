@@ -31,20 +31,37 @@ jobs:
           set -euo pipefail
           
           # Get files changed in the latest commit only
-          CHANGED_DIRS=$(git diff-tree --no-commit-id --name-only -r HEAD \
-            | grep '\.tf$' \
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD || echo "")
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "❌ No files detected in the latest commit."
+            exit 1
+          fi
+          
+          # Filter for .tf files and extract directories
+          CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep '\.tf$' || echo "")
+          
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "❌ No Terraform (.tf) files changed in the latest commit."
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            exit 1
+          fi
+          
+          # Extract unique directories and convert to JSON array
+          DIRS_JSON=$(echo "$CHANGED_DIRS" \
             | xargs -I {} dirname {} \
             | sort -u \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
-          if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
-            echo "❌ No Terraform changes detected in the latest commit."
+          if [ "$DIRS_JSON" == "[]" ] || [ "$DIRS_JSON" == "null" ]; then
+            echo "❌ No valid directories extracted from Terraform files."
             exit 1
           fi
           
-          echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+          echo "directories=$DIRS_JSON" >> $GITHUB_OUTPUT
           echo "✅ Detected Terraform directories in latest commit:"
-          echo "$CHANGED_DIRS" | jq -r '.[]'
+          echo "$DIRS_JSON" | jq -r '.[]'
 
   finops-gate:
     needs: detect-directories
