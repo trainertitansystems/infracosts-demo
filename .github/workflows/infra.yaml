@@ -1,4 +1,4 @@
-name: Terraform PR Cost Governance (Enterprise)
+name: Terraform PR Cost Governance (Grounded Enterprise)
 
 on:
   pull_request:
@@ -17,7 +17,7 @@ jobs:
 
     steps:
       # -------------------------------------------------
-      # Checkout PR branch
+      # Checkout PR
       # -------------------------------------------------
       - name: Checkout PR
         uses: actions/checkout@v4
@@ -35,7 +35,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Authenticate to GCP (Terraform backend)
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
@@ -43,7 +43,7 @@ jobs:
           create_credentials_file: true
 
       # -------------------------------------------------
-      # Detect changed Terraform directories dynamically
+      # Detect changed Terraform directories
       # -------------------------------------------------
       - name: Detect changed Terraform directories
         id: detect
@@ -57,7 +57,6 @@ jobs:
             | sort -u)
 
           if [ -z "$DIRS" ]; then
-            echo "No Terraform changes detected."
             echo "NO_CHANGES=true" >> $GITHUB_ENV
             exit 0
           fi
@@ -65,23 +64,28 @@ jobs:
           echo "DIRS=$DIRS" >> $GITHUB_ENV
 
       # -------------------------------------------------
-      # Run Terraform Plan + Infracost per directory
+      # Terraform Plan + Infracost
       # -------------------------------------------------
       - name: Run Terraform + Infracost
         if: env.NO_CHANGES != 'true'
         run: |
           set -e
           echo "" > combined.md
+          echo "" > resources.txt
 
           for DIR in $DIRS; do
             if [ -d "$DIR" ]; then
-              echo "Processing $DIR"
-
               pushd "$DIR"
 
               terraform init -reconfigure -input=false
               terraform plan -refresh=true -out=tfplan.binary -input=false
               terraform show -json tfplan.binary > plan.json
+
+              # Extract resource types
+              jq -r '.resource_changes[].type' plan.json | sort -u >> ../resources.txt
+
+              # Extract region if available
+              jq -r '..|.region? // empty' plan.json | sort -u >> ../region.txt || true
 
               infracost breakdown \
                 --path plan.json \
@@ -91,7 +95,6 @@ jobs:
               popd
 
               echo "## 📦 $DIR" >> combined.md
-              echo "" >> combined.md
               echo '```' >> combined.md
               cat "$DIR/infracost.md" >> combined.md
               echo '```' >> combined.md
@@ -100,12 +103,17 @@ jobs:
           done
 
       # -------------------------------------------------
-      # Build Enterprise FinOps Governance Prompt
+      # Build Grounded Gemini Request
       # -------------------------------------------------
       - name: Build Gemini Request
         if: env.NO_CHANGES != 'true'
         run: |
+          RESOURCE_TYPES=$(sort -u resources.txt | tr '\n' ',' | sed 's/,$//')
+          REGION=$(sort -u region.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
           jq -n \
+            --arg resources "$RESOURCE_TYPES" \
+            --arg region "$REGION" \
             --rawfile infra combined.md \
             '{
               contents: [
@@ -113,32 +121,25 @@ jobs:
                   parts: [
                     {
                       text: (
-                        "You are a Principal FinOps Architect reviewing a production-bound Terraform PR in Google Cloud.\n\n" +
+                        "You are a Principal FinOps Architect reviewing a Google Cloud Terraform PR.\n\n" +
 
-                        "This is a cost governance decision analysis.\n" +
-                        "Engineers will act based on this output.\n\n" +
+                        "Detected Resource Types: " + $resources + "\n" +
+                        "Detected Region(s): " + $region + "\n\n" +
 
-                        "Analyze resources dynamically and infer pricing models from resource types.\n\n" +
+                        "Provide quantitative cost governance analysis.\n\n" +
 
-                        "STRICT OUTPUT FORMAT (use only these sections):\n\n" +
-                        "• Pricing Model\n" +
-                        "• Cost Structure (Fixed vs Variable)\n" +
-                        "• Scaling Sensitivity\n" +
-                        "• Hidden / Indirect Cost Surfaces\n" +
-                        "• Cost Risk Level (LOW / MEDIUM / HIGH)\n" +
-                        "• Deployment Recommendation (APPROVE / REVIEW / ESCALATE)\n\n" +
+                        "Return ONLY a Markdown table with columns:\n" +
+                        "| Component | Pricing Mechanism | Typical GCP Cost Range (USD) | Cost Trigger | Risk Level |\n\n" +
 
-                        "Rules:\n" +
+                        "Requirements:\n" +
                         "- Assume Google Cloud.\n" +
-                        "- Do not assume a specific service type.\n" +
-                        "- Infer billing dimensions implicitly from service design.\n" +
-                        "- Distinguish control-plane vs workload/data-plane pricing when applicable.\n" +
-                        "- If cost is $0, explain when it becomes billable.\n" +
-                        "- Identify scaling multipliers or amplification factors.\n" +
-                        "- Be concise (max 170 words).\n" +
+                        "- Use realistic pricing ranges in USD.\n" +
+                        "- Identify billing dimensions.\n" +
+                        "- Identify scaling multipliers.\n" +
+                        "- If currently $0, explain trigger condition.\n" +
                         "- No generic advice.\n\n" +
 
-                        "Terraform PR cost output:\n\n" +
+                        "Infracost Summary:\n\n" +
                         $infra
                       )
                     }
@@ -167,8 +168,6 @@ jobs:
           BODY=$(echo "$RESPONSE" | sed '$d')
           STATUS=$(echo "$RESPONSE" | tail -n1)
 
-          echo "Gemini HTTP Status: $STATUS"
-
           if [ "$STATUS" = "429" ]; then
             echo "⚠️ Gemini quota exceeded. AI review skipped." > gemini.md
             exit 0
@@ -179,10 +178,10 @@ jobs:
             exit 0
           fi
 
-          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text // "No analysis returned."' > gemini.md
+          echo "$BODY" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
 
       # -------------------------------------------------
-      # Post PR Comment
+      # Comment on PR
       # -------------------------------------------------
       - name: Comment PR
         if: env.NO_CHANGES != 'true'
@@ -196,7 +195,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "## 🤖 FinOps Governance Analysis"
+            echo "## 🤖 FinOps Quantitative Analysis"
             echo ""
             cat gemini.md
           } > comment.md
