@@ -1,4 +1,4 @@
-name: Terraform PR FinOps Gate (Crisp Shadow Mode)
+name: Terraform PR FinOps Gate (Validated + Gemini)
 
 on:
   pull_request:
@@ -30,7 +30,7 @@ jobs:
         fetch-depth: 0
 
     # =====================================================
-    # GCP Authentication
+    # Authenticate to Google Cloud
     # =====================================================
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
@@ -40,7 +40,7 @@ jobs:
         create_credentials_file: true
 
     # =====================================================
-    # Install dependencies
+    # Install bc (required for numeric comparison)
     # =====================================================
     - name: Install dependencies
       run: |
@@ -100,7 +100,7 @@ jobs:
       run: terraform show -json pr.tfplan > plan.json
 
     # =====================================================
-    # Infracost
+    # Run Infracost
     # =====================================================
     - name: Run Infracost
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -111,7 +111,7 @@ jobs:
           --out-file infracost.json
 
     # =====================================================
-    # Hard Cost Gate
+    # HARD COST GATE
     # =====================================================
     - name: Enforce monthly cost limit
       working-directory: ${{ steps.tfroot.outputs.dir }}
@@ -128,11 +128,12 @@ jobs:
         echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
     # =====================================================
-    # Build Gemini Shadow Cost Request (Crisp Mode)
+    # Build Gemini Shadow Cost Request (Crisp + Dependent-aware)
     # =====================================================
     - name: Build Gemini request
       working-directory: ${{ steps.tfroot.outputs.dir }}
       run: |
+        set -euo pipefail
         INFRACOST=$(cat infracost.json)
 
         jq -n \
@@ -144,22 +145,21 @@ jobs:
                 text: (
 "You are a Principal FinOps Architect performing a Shadow Cost audit.\n\n" +
 
-"Direct cost (authoritative): $" + $total + " USD\n\n" +
+"Direct cost (authoritative from Infracost): $" + $total + " USD\n\n" +
 
 "Use Infracost as truth for direct recurring cost.\n" +
-"Also enumerate dependent/usage-based billing surfaces triggered after deployment.\n" +
-"Be crisp. No fluff. Max 180 words.\n\n" +
+"Additionally enumerate dependent/usage-based services triggered AFTER deployment.\n" +
+"Be crisp. Max 180 words. No generic advice.\n\n" +
 
-"Include:\n" +
+"For each detected component provide:\n" +
 "- Direct cost summary (1 sentence)\n" +
-"- Shadow billing surfaces (component — billing unit — trigger — price range)\n" +
-"- Terraform guardrails\n" +
-"- Risk rating\n\n" +
+"- Dependent billing surfaces (component — billing unit — trigger — price range)\n" +
+"- Concrete Terraform guardrail\n" +
+"- Risk rating (LOW/MEDIUM/HIGH)\n\n" +
 
 "Use 2026 anchors where relevant:\n" +
 "Egress ~$0.12/GB | Inter-region ~$0.01–0.08/GB | NAT ~$0.045/hr + ~$0.045/GB | " +
-"LB ~$0.008–0.025/GB | Logging ~$0.50/GB | Snapshots ~$0.026/GB | " +
-"Static IP ~$0.004/hr | BigQuery ~$6.25/TB\n\n" +
+"LB ~$0.008–0.025/GB | Logging ~$0.50/GB | Snapshots ~$0.026/GB | Static IP ~$0.004/hr\n\n" +
 
 "Infracost JSON:\n" + $infracost
                 )
@@ -185,7 +185,7 @@ jobs:
           > gemini.md
 
     # =====================================================
-    # PR Comment
+    # PR Comment (Safe)
     # =====================================================
     - name: Comment PR
       env:
