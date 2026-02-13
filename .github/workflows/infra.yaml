@@ -32,12 +32,10 @@ jobs:
         run: |
           set -euo pipefail
           CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
-
           if [ -z "$CHANGED" ]; then
             echo "No Terraform files changed in latest commit."
             exit 1
           fi
-
           if ! echo "$CHANGED" | grep -q '^infracost/'; then
             echo "Latest commit does not modify infracost root."
             exit 1
@@ -82,14 +80,11 @@ jobs:
         run: |
           set -euo pipefail
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost/infracost.json)
-
           echo "Estimated Monthly Cost: $TOTAL USD"
-
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
             echo "Cost exceeds allowed threshold"
             exit 1
           fi
-
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
       - name: Build Gemini Request
