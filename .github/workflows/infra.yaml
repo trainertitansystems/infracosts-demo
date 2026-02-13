@@ -21,24 +21,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ----------------------------------------
-      # Checkout PR HEAD (latest commit)
-      # ----------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      # ----------------------------------------
-      # Install required tools
-      # ----------------------------------------
       - name: Install jq and bc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
 
-      # ----------------------------------------
-      # Ensure latest commit modified infracost
-      # ----------------------------------------
-      - name: Verify latest commit affects infracost
+      - name: Verify latest commit modifies infracost
         run: |
           set -euo pipefail
           CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
@@ -53,12 +44,6 @@ jobs:
             exit 1
           fi
 
-          echo "Terraform changes detected:"
-          echo "$CHANGED"
-
-      # ----------------------------------------
-      # Authenticate to Google Cloud
-      # ----------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -66,9 +51,6 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # ----------------------------------------
-      # Setup Terraform & Infracost
-      # ----------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -77,9 +59,6 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # ----------------------------------------
-      # Terraform Plan (always from root)
-      # ----------------------------------------
       - name: Terraform Init
         working-directory: ${{ env.TF_ROOT }}
         run: terraform init -input=false -lock=false
@@ -92,9 +71,6 @@ jobs:
         working-directory: ${{ env.TF_ROOT }}
         run: terraform show -json plan.tfplan > plan.json
 
-      # ----------------------------------------
-      # Infracost Breakdown
-      # ----------------------------------------
       - name: Run Infracost
         working-directory: ${{ env.TF_ROOT }}
         run: |
@@ -103,9 +79,6 @@ jobs:
             --format json \
             --out-file infracost.json
 
-      # ----------------------------------------
-      # Hard Cost Gate
-      # ----------------------------------------
       - name: Enforce cost threshold
         working-directory: ${{ env.TF_ROOT }}
         run: |
@@ -115,87 +88,14 @@ jobs:
           echo "Estimated Monthly Cost: $TOTAL USD"
 
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "Cost exceeds allowed threshold ($MAX_MONTHLY_COST_USD USD)"
+            echo "Cost exceeds allowed threshold"
             exit 1
           fi
 
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-      # ----------------------------------------
-      # Build Gemini Prompt (Enterprise-Safe)
-      # ----------------------------------------
       - name: Build Gemini Request
         working-directory: ${{ env.TF_ROOT }}
         run: |
-          set -euo pipefail
-
           cat <<EOF > prompt.txt
-You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
-
-Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
-
-Treat Infracost as the source of truth for direct cost.
-Identify dependent usage-based billing triggers activated after deployment.
-
-Be concise, precise, and technical.
-
-For each detected component include:
-- Direct cost summary (1 line)
-- Dependent billing surfaces (component | billing unit | trigger | realistic price range)
-- Concrete Terraform guardrail recommendation
-- Risk rating (LOW / MEDIUM / HIGH)
-
-Use 2026 pricing anchors when relevant:
-Egress ~$0.12/GB
-Inter-region ~$0.01-0.08/GB
-NAT ~$0.045/hr + ~$0.045/GB
-Load Balancer ~$0.008-0.025/GB
-Logging ~$0.50/GB
-Snapshots ~$0.026/GB
-Static IP ~$0.004/hr
-
-Infracost JSON:
-EOF
-
-          cat infracost.json >> prompt.txt
-
-          jq -n --rawfile text prompt.txt \
-            '{ contents: [{ parts: [{ text: $text }] }] }' \
-            > gemini_request.json
-
-      # ----------------------------------------
-      # Call Gemini API
-      # ----------------------------------------
-      - name: Call Gemini
-        working-directory: ${{ env.TF_ROOT }}
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          set -euo pipefail
-          curl -sS \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d @gemini_request.json \
-            | jq -r '.candidates[0].content.parts[0].text // "No response"' \
-            > gemini.md
-
-      # ----------------------------------------
-      # Comment on PR
-      # ----------------------------------------
-      - name: Comment on PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: ${{ env.TF_ROOT }}
-        run: |
-          {
-            echo "## 🤖 Terraform PR FinOps Review"
-            echo ""
-            echo "**Terraform Root:** infracost/"
-            echo "**Estimated Monthly Cost:** ${TOTAL} USD"
-            echo ""
-            echo "---"
-            echo ""
-            cat gemini.md
-          } > comment.md
-
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a
