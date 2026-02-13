@@ -20,10 +20,11 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      directories: ${{ steps.set.outputs.directories }}
+      directories: ${{ steps.detect.outputs.directories }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -31,24 +32,25 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
 
       - name: Detect changed Terraform directories
-        id: set
+        id: detect
         run: |
           set -euo pipefail
 
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          FILES=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
+          FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$' || true)
 
           if [ -z "$FILES" ]; then
-            echo "directories=[]" >> $GITHUB_OUTPUT
+            echo "directories=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           DIRS=$(echo "$FILES" | xargs -I {} dirname {} | sort -u)
+
           JSON=$(echo "$DIRS" | jq -R -s -c 'split("\n") | map(select(length>0))')
 
-          echo "directories=$JSON" >> $GITHUB_OUTPUT
+          echo "directories=$JSON" >> "$GITHUB_OUTPUT"
 
 
   finops:
@@ -62,8 +64,8 @@ jobs:
         directory: ${{ fromJson(needs.detect.outputs.directories) }}
 
     steps:
-
-      - uses: actions/checkout@v4
+      - name: Checkout PR head
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -77,8 +79,11 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      - uses: hashicorp/setup-terraform@v3
-      - uses: infracost/actions/setup@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
@@ -106,8 +111,11 @@ jobs:
         working-directory: ${{ matrix.directory }}
         run: |
           set -euo pipefail
+
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
+          echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
+
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
             echo "Cost exceeds threshold"
             exit 1
