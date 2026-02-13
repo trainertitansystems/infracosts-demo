@@ -23,26 +23,26 @@ jobs:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
-      - name: Detect Terraform directories
+      - name: Detect Terraform directories from latest commit
         id: set-matrix
         run: |
           set -euo pipefail
           
-          # Get only the directories that have .tf files CHANGED in this PR
-          git fetch origin main
-          CHANGED_FILES=$(git diff --name-only origin/main...HEAD | grep '\.tf$' || echo "")
+          # Get files changed in the latest commit only (HEAD vs HEAD~1)
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || echo "")
           
           if [ -z "$CHANGED_FILES" ]; then
-            echo "❌ No Terraform files changed in PR."
+            echo "❌ No Terraform files changed in the latest commit."
             exit 1
           fi
           
-          echo "Changed .tf files:"
+          echo "🔍 Changed .tf files in latest commit:"
           echo "$CHANGED_FILES"
+          echo ""
           
-          # Extract unique directories from changed files only
+          # Extract unique directories from changed files
           CHANGED_DIRS=$(echo "$CHANGED_FILES" \
             | xargs -I {} dirname {} \
             | sort -u \
@@ -54,7 +54,7 @@ jobs:
           fi
           
           echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
-          echo "✅ Detected Terraform directories with changes:"
+          echo "✅ Will analyze these directories:"
           echo "$CHANGED_DIRS" | jq -r '.[]'
 
   finops-gate:
@@ -111,7 +111,7 @@ jobs:
 
       - name: Terraform Plan
         working-directory: ${{ matrix.directory }}
-        run: terraform plan -out=pr.tfplan -lock=false
+        run: terraform plan -out=pr.tfplan -lock=false -input=false
 
       - name: Export Plan JSON
         working-directory: ${{ matrix.directory }}
@@ -152,35 +152,19 @@ jobs:
         run: |
           set -euo pipefail
           
-          jq -n \
-            --argjson cost "$(cat infracost.json)" \
-            --arg total "$TOTAL" \
-            '{
-              contents: [{
-                parts: [{
-                  text:
-                    "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\n" +
-                    "Direct Monthly Cost (authoritative from Infracost): $" + $total + " USD.\n\n" +
-                    "Treat Infracost as source of truth for direct cost.\n" +
-                    "Identify dependent usage-based billing triggers activated after deployment.\n" +
-                    "Be concise, precise, and technical.\n\n" +
-                    "For each detected component include:\n" +
-                    "- Direct cost summary (1 line)\n" +
-                    "- Dependent billing surfaces (component | billing unit | trigger | realistic price range)\n" +
-                    "- Concrete Terraform guardrail recommendation\n" +
-                    "- Risk rating (LOW / MEDIUM / HIGH)\n\n" +
-                    "Use 2026 pricing anchors when relevant:\n" +
-                    "Egress ~$0.12/GB\n" +
-                    "Inter-region ~$0.01-0.08/GB\n" +
-                    "NAT ~$0.045/hr + ~$0.045/GB\n" +
-                    "Load Balancer ~$0.008-0.025/GB\n" +
-                    "Logging ~$0.50/GB\n" +
-                    "Snapshots ~$0.026/GB\n" +
-                    "Static IP ~$0.004/hr\n\n" +
-                    "Infracost JSON:\n" + ($cost | tostring)
-                }]
-              }]
-            }' > gemini_request.json
+          # Read Infracost JSON
+          INFRACOST_JSON=$(cat infracost.json | jq -c .)
+          
+          # Build the prompt using cat with heredoc
+          cat > gemini_request.json <<EOF
+{
+  "contents": [{
+    "parts": [{
+      "text": "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\nDirect Monthly Cost (authoritative from Infracost): \$$TOTAL USD.\n\nTreat Infracost as source of truth for direct cost.\nIdentify dependent usage-based billing triggers activated after deployment.\nBe concise, precise, and technical.\n\nFor each detected component include:\n- Direct cost summary (1 line)\n- Dependent billing surfaces (component | billing unit | trigger | realistic price range)\n- Concrete Terraform guardrail recommendation\n- Risk rating (LOW / MEDIUM / HIGH)\n\nUse 2026 pricing anchors when relevant:\nEgress ~\$0.12/GB\nInter-region ~\$0.01-0.08/GB\nNAT ~\$0.045/hr + ~\$0.045/GB\nLoad Balancer ~\$0.008-0.025/GB\nLogging ~\$0.50/GB\nSnapshots ~\$0.026/GB\nStatic IP ~\$0.004/hr\n\nInfracost JSON:\n$INFRACOST_JSON"
+    }]
+  }]
+}
+EOF
 
       # --------------------------------------------------
       # Call Gemini API
