@@ -23,37 +23,69 @@ jobs:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Debug - Show git history
+        run: |
+          echo "=== Last 5 commits ==="
+          git log --oneline -5
+          echo ""
+          echo "=== HEAD commit ==="
+          git log -1 HEAD
+          echo ""
+          echo "=== HEAD~1 commit ==="
+          git log -1 HEAD~1
 
       - name: Detect Terraform directories from latest commit
         id: set-matrix
         run: |
           set -euo pipefail
           
+          echo "=== Comparing HEAD~1 to HEAD ==="
+          git diff --name-only HEAD~1 HEAD
+          echo ""
+          
+          echo "=== Filtering for .tf files ==="
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || echo "")
           
           if [ -z "$CHANGED_FILES" ]; then
-            echo "No Terraform files changed in the latest commit"
+            echo "ERROR: No Terraform files changed in the latest commit"
             exit 1
           fi
           
-          echo "Changed tf files in latest commit:"
+          echo "Changed .tf files:"
           echo "$CHANGED_FILES"
+          echo ""
           
-          CHANGED_DIRS=$(echo "$CHANGED_FILES" | xargs -I {} dirname {} | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "=== Extracting directories ==="
+          DIRS=$(echo "$CHANGED_FILES" | xargs -I {} dirname {})
+          echo "Directories before sort/unique:"
+          echo "$DIRS"
+          echo ""
+          
+          UNIQUE_DIRS=$(echo "$DIRS" | sort -u)
+          echo "Unique directories:"
+          echo "$UNIQUE_DIRS"
+          echo ""
+          
+          CHANGED_DIRS=$(echo "$UNIQUE_DIRS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "JSON array:"
+          echo "$CHANGED_DIRS"
+          echo ""
           
           if echo "$CHANGED_DIRS" | jq -e 'any(. == ".")' > /dev/null; then
-            echo "Terraform at repo root is forbidden"
+            echo "ERROR: Terraform at repo root is forbidden"
             exit 1
           fi
           
           if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
-            echo "No valid directories found"
+            echo "ERROR: No valid directories found"
             exit 1
           fi
           
           echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
-          echo "Will analyze:"
+          echo ""
+          echo "=== FINAL: Will analyze these directories ==="
           echo "$CHANGED_DIRS" | jq -r '.[]'
 
   finops-gate:
@@ -183,14 +215,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: ${{ matrix.directory }}
         run: |
-          cat > comment.md << 'COMMENT_EOF'
-          ## 🤖 Terraform PR FinOps Review - `${{ matrix.directory }}`
-
-          **Directory:** `${{ matrix.directory }}`
-          **Estimated Monthly Cost:** $${TOTAL} USD
-
-          ---
-
-          COMMENT_EOF
+          cat > comment.md <<'EOF'
+## 🤖 Terraform PR FinOps Review
+EOF
+          echo "" >> comment.md
+          echo "**Directory:** \`${{ matrix.directory }}\`" >> comment.md
+          echo "**Estimated Monthly Cost:** \$${TOTAL} USD" >> comment.md
+          echo "" >> comment.md
+          echo "---" >> comment.md
+          echo "" >> comment.md
           cat gemini.md >> comment.md
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
