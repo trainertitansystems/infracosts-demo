@@ -35,7 +35,6 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
@@ -47,11 +46,9 @@ jobs:
           fi
 
           DIRS=$(echo "$FILES" | xargs -I {} dirname {} | sort -u)
-
           JSON=$(echo "$DIRS" | jq -R -s -c 'split("\n") | map(select(length>0))')
 
           echo "directories=$JSON" >> "$GITHUB_OUTPUT"
-
 
   finops:
     needs: detect
@@ -79,11 +76,8 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Setup Infracost
-        uses: infracost/actions/setup@v3
+      - uses: hashicorp/setup-terraform@v3
+      - uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
@@ -111,9 +105,7 @@ jobs:
         working-directory: ${{ matrix.directory }}
         run: |
           set -euo pipefail
-
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
 
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
@@ -124,21 +116,21 @@ jobs:
       - name: Build Gemini Prompt
         working-directory: ${{ matrix.directory }}
         run: |
-          cat <<EOF > prompt.txt
+          cat <<'EOF' > prompt.txt
 You are a Principal FinOps Cloud Architect performing a Shadow Cost review.
 
-Direct Monthly Cost (authoritative): ${TOTAL} USD.
+Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
 
 Treat Infracost as source of truth.
-Identify dependent usage-based billing triggers.
+Identify dependent usage-based billing triggers activated after deployment.
 
-Be concise and technical.
+Be concise, precise, and technical.
 
-Include:
-- Direct cost summary
-- Dependent billing surfaces
-- Terraform guardrail recommendation
-- Risk rating
+For each detected component include:
+- Direct cost summary (1 line)
+- Dependent billing surfaces (component | billing unit | trigger | realistic price range)
+- Concrete Terraform guardrail recommendation
+- Risk rating (LOW / MEDIUM / HIGH)
 
 Infracost JSON:
 EOF
