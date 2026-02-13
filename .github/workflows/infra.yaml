@@ -37,17 +37,13 @@ jobs:
           set -euo pipefail
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
           FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$' || true)
-
           if [ -z "$FILES" ]; then
             echo "directories=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           DIRS=$(echo "$FILES" | xargs -I {} dirname {} | sort -u)
           JSON=$(echo "$DIRS" | jq -R -s -c 'split("\n") | map(select(length>0))')
-
           echo "directories=$JSON" >> "$GITHUB_OUTPUT"
 
   finops:
@@ -107,7 +103,6 @@ jobs:
           set -euo pipefail
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
-
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
             echo "Cost exceeds threshold"
             exit 1
@@ -116,30 +111,27 @@ jobs:
       - name: Build Gemini Prompt
         working-directory: ${{ matrix.directory }}
         run: |
-          cat <<'EOF' > prompt.txt
-You are a Principal FinOps Cloud Architect performing a Shadow Cost review.
+          set -euo pipefail
+          INFRACOST_JSON=$(jq -c . infracost.json)
+          PROMPT="You are a Principal FinOps Cloud Architect performing a Shadow Cost review.
 
-Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
+          Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
 
-Treat Infracost as source of truth.
-Identify dependent usage-based billing triggers activated after deployment.
+          Treat Infracost as source of truth.
+          Identify dependent usage-based billing triggers activated after deployment.
 
-Be concise, precise, and technical.
+          Be concise, precise, and technical.
 
-For each detected component include:
-- Direct cost summary (1 line)
-- Dependent billing surfaces (component | billing unit | trigger | realistic price range)
-- Concrete Terraform guardrail recommendation
-- Risk rating (LOW / MEDIUM / HIGH)
+          For each detected component include:
+          - Direct cost summary (1 line)
+          - Dependent billing surfaces (component | billing unit | trigger | realistic price range)
+          - Concrete Terraform guardrail recommendation
+          - Risk rating (LOW / MEDIUM / HIGH)
 
-Infracost JSON:
-EOF
-
-          cat infracost.json >> prompt.txt
-
-          jq -n --rawfile text prompt.txt \
-            '{ contents: [{ parts: [{ text: $text }] }] }' \
-            > gemini_request.json
+          Infracost JSON:
+          ${INFRACOST_JSON}"
+          
+          jq -n --arg text "$PROMPT" '{"contents":[{"parts":[{"text":$text}]}]}' > gemini_request.json
 
       - name: Call Gemini
         working-directory: ${{ matrix.directory }}
@@ -168,5 +160,4 @@ EOF
             echo ""
             cat gemini.md
           } > comment.md
-
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
