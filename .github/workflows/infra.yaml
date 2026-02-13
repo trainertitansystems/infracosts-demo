@@ -14,7 +14,6 @@ permissions:
 
 env:
   MAX_MONTHLY_COST_USD: "50"
-  TF_ROOT: "infracost"
 
 jobs:
   finops:
@@ -60,19 +59,19 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       - name: Terraform Init
-        working-directory: ${{ env.TF_ROOT }}
+        working-directory: infracost
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        working-directory: ${{ env.TF_ROOT }}
+        working-directory: infracost
         run: terraform plan -out=plan.tfplan -input=false -lock=false
 
       - name: Export plan JSON
-        working-directory: ${{ env.TF_ROOT }}
+        working-directory: infracost
         run: terraform show -json plan.tfplan > plan.json
 
       - name: Run Infracost
-        working-directory: ${{ env.TF_ROOT }}
+        working-directory: infracost
         run: |
           infracost breakdown \
             --path plan.json \
@@ -80,10 +79,9 @@ jobs:
             --out-file infracost.json
 
       - name: Enforce cost threshold
-        working-directory: ${{ env.TF_ROOT }}
         run: |
           set -euo pipefail
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost/infracost.json)
 
           echo "Estimated Monthly Cost: $TOTAL USD"
 
@@ -95,7 +93,55 @@ jobs:
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
       - name: Build Gemini Request
-        working-directory: ${{ env.TF_ROOT }}
         run: |
           cat <<EOF > prompt.txt
-You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a
+You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
+
+Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
+
+Treat Infracost as source of truth.
+Identify dependent usage-based billing triggers.
+Be concise and technical.
+
+Include:
+- Direct cost summary
+- Dependent billing surfaces
+- Terraform guardrail recommendation
+- Risk rating
+
+Infracost JSON:
+EOF
+
+          cat infracost/infracost.json >> prompt.txt
+
+          jq -n --rawfile text prompt.txt \
+            '{ contents: [{ parts: [{ text: $text }] }] }' \
+            > gemini_request.json
+
+      - name: Call Gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -sS \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text // "No response"' \
+            > gemini.md
+
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🤖 Terraform PR FinOps Review"
+            echo ""
+            echo "**Terraform Root:** infracost/"
+            echo "**Estimated Monthly Cost:** ${TOTAL} USD"
+            echo ""
+            echo "---"
+            echo ""
+            cat gemini.md
+          } > comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
