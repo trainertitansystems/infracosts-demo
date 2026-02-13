@@ -30,21 +30,31 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Get all directories with .tf files changed in PR
+          # Get only the directories that have .tf files CHANGED in this PR
           git fetch origin main
-          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
-            | grep '\.tf$' \
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD | grep '\.tf$' || echo "")
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "❌ No Terraform files changed in PR."
+            exit 1
+          fi
+          
+          echo "Changed .tf files:"
+          echo "$CHANGED_FILES"
+          
+          # Extract unique directories from changed files only
+          CHANGED_DIRS=$(echo "$CHANGED_FILES" \
             | xargs -I {} dirname {} \
             | sort -u \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
           if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
-            echo "❌ No Terraform changes detected in PR."
+            echo "❌ No valid directories found."
             exit 1
           fi
           
           echo "directories=$CHANGED_DIRS" >> $GITHUB_OUTPUT
-          echo "✅ Detected Terraform directories:"
+          echo "✅ Detected Terraform directories with changes:"
           echo "$CHANGED_DIRS" | jq -r '.[]'
 
   finops-gate:
