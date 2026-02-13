@@ -32,12 +32,14 @@ jobs:
       # Install required tools
       # ----------------------------------------
       - name: Install jq and bc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc
 
       # ----------------------------------------
-      # Detect Terraform directory from latest commit ONLY
+      # Detect Terraform directory from LATEST commit only
       # ----------------------------------------
-      - name: Detect changed directory
+      - name: Detect changed directory (latest commit only)
         id: detect
         run: |
           set -euo pipefail
@@ -50,9 +52,9 @@ jobs:
           fi
 
           DIR=$(echo "$CHANGED_FILES" | head -n1 | xargs dirname)
-          echo "Detected directory: $DIR"
 
-          echo "dir=$DIR" >> $GITHUB_OUTPUT
+          echo "Detected directory: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------
       # Authenticate to GCP
@@ -111,8 +113,8 @@ jobs:
           set -euo pipefail
 
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
+          echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
           echo "Estimated Monthly Cost: $TOTAL USD"
 
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
@@ -121,7 +123,7 @@ jobs:
           fi
 
       # ----------------------------------------
-      # Build Gemini Prompt (Enterprise-Safe Method)
+      # Build Gemini Prompt (Enterprise Safe)
       # ----------------------------------------
       - name: Build Gemini Request
         working-directory: ${{ steps.detect.outputs.dir }}
@@ -187,13 +189,15 @@ EOF
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
-          echo "## Terraform PR FinOps Review" > comment.md
-          echo "" >> comment.md
-          echo "**Directory:** ${{ steps.detect.outputs.dir }}" >> comment.md
-          echo "**Estimated Monthly Cost:** $TOTAL USD" >> comment.md
-          echo "" >> comment.md
-          echo "---" >> comment.md
-          echo "" >> comment.md
-          cat gemini.md >> comment.md
+          {
+            echo "## Terraform PR FinOps Review"
+            echo ""
+            echo "**Directory:** ${{ steps.detect.outputs.dir }}"
+            echo "**Estimated Monthly Cost:** $TOTAL USD"
+            echo ""
+            echo "---"
+            echo ""
+            cat gemini.md
+          } > comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
