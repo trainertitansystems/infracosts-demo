@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Get files changed in the latest commit only (HEAD vs HEAD~1)
+          # Get files changed in the latest commit only
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || echo "")
           
           if [ -z "$CHANGED_FILES" ]; then
@@ -47,6 +47,12 @@ jobs:
             | xargs -I {} dirname {} \
             | sort -u \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          # Check for repo root
+          if echo "$CHANGED_DIRS" | jq -e 'any(. == ".")' > /dev/null; then
+            echo "❌ Terraform at repo root is forbidden"
+            exit 1
+          fi
           
           if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
             echo "❌ No valid directories found."
@@ -73,15 +79,8 @@ jobs:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      # --------------------------------------------------
-      # Install dependencies
-      # --------------------------------------------------
-      - name: Install jq & bc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
 
       # --------------------------------------------------
       # Authenticate to Google Cloud
@@ -92,6 +91,18 @@ jobs:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
+
+      - name: Verify authentication
+        run: gcloud auth list
+
+      # --------------------------------------------------
+      # Clean runtime artifacts
+      # --------------------------------------------------
+      - name: Clean runtime artifacts
+        run: |
+          rm -rf .terraform **/.terraform
+          rm -f **/*.tfplan **/*.binary
+          rm -f **/plan.json **/infracost*.json
 
       # --------------------------------------------------
       # Setup Terraform & Infracost
@@ -138,11 +149,13 @@ jobs:
           set -euo pipefail
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
           echo "PR monthly cost: $TOTAL USD"
+          echo "Limit: $MAX_MONTHLY_COST_USD USD"
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
             echo "❌ Cost exceeds allowed threshold ($MAX_MONTHLY_COST_USD USD)"
             exit 1
           fi
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+          echo "✅ Cost within allowed limit"
 
       # --------------------------------------------------
       # Build Gemini Prompt
@@ -155,7 +168,7 @@ jobs:
           # Read Infracost JSON
           INFRACOST_JSON=$(cat infracost.json | jq -c .)
           
-          # Build the prompt using cat with heredoc
+          # Build the prompt using heredoc
           cat > gemini_request.json <<EOF
 {
   "contents": [{
@@ -208,11 +221,10 @@ EOF
         working-directory: ${{ matrix.directory }}
         run: |
           {
-            echo "## Terraform PR FinOps Review - \`${{ matrix.directory }}\`"
+            echo "## 🤖 Terraform PR FinOps Review - \`${{ matrix.directory }}\`"
             echo ""
-            echo "**Directory:** ${{ matrix.directory }}"
-            echo ""
-            echo "**Estimated Monthly Cost:** $TOTAL USD"
+            echo "**Directory:** \`${{ matrix.directory }}\`"
+            echo "**Estimated Monthly Cost:** \$${TOTAL} USD"
             echo ""
             echo "---"
             echo ""
