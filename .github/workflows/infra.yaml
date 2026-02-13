@@ -15,61 +15,8 @@ env:
   MAX_MONTHLY_COST_USD: "50"
 
 jobs:
-  detect-directories:
-    runs-on: ubuntu-latest
-    outputs:
-      directories: ${{ steps.set-matrix.outputs.directories }}
-    steps:
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Detect Terraform directories
-        id: set-matrix
-        run: |
-          set -euo pipefail
-          
-          # Get files changed in the latest commit only
-          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD || echo "")
-          
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "❌ No files detected in the latest commit."
-            exit 1
-          fi
-          
-          # Filter for .tf files and extract directories
-          CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep '\.tf$' || echo "")
-          
-          if [ -z "$CHANGED_DIRS" ]; then
-            echo "❌ No Terraform (.tf) files changed in the latest commit."
-            echo "Changed files:"
-            echo "$CHANGED_FILES"
-            exit 1
-          fi
-          
-          # Extract unique directories and convert to JSON array
-          DIRS_JSON=$(echo "$CHANGED_DIRS" \
-            | xargs -I {} dirname {} \
-            | sort -u \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          
-          if [ "$DIRS_JSON" == "[]" ] || [ "$DIRS_JSON" == "null" ]; then
-            echo "❌ No valid directories extracted from Terraform files."
-            exit 1
-          fi
-          
-          echo "directories=$DIRS_JSON" >> $GITHUB_OUTPUT
-          echo "✅ Detected Terraform directories in latest commit:"
-          echo "$DIRS_JSON" | jq -r '.[]'
-
   finops-gate:
-    needs: detect-directories
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        directory: ${{ fromJson(needs.detect-directories.outputs.directories) }}
-      fail-fast: false
 
     steps:
 
@@ -100,6 +47,36 @@ jobs:
           create_credentials_file: true
 
       # --------------------------------------------------
+      # Detect Terraform directory changed in PR
+      # --------------------------------------------------
+      - name: Detect Terraform directory
+        id: tfdir
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+
+          CHANGED_DIRS=$(git diff --name-only origin/main...HEAD \
+            | grep '\.tf$' \
+            | xargs -I {} dirname {} \
+            | sort -u)
+
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "❌ No Terraform changes detected."
+            exit 1
+          fi
+
+          COUNT=$(echo "$CHANGED_DIRS" | wc -l | tr -d ' ')
+
+          if [ "$COUNT" -ne 1 ]; then
+            echo "❌ Exactly ONE Terraform directory must be modified per PR."
+            echo "$CHANGED_DIRS"
+            exit 1
+          fi
+
+          echo "dir=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------------
       # Setup Terraform & Infracost
       # --------------------------------------------------
       - uses: hashicorp/setup-terraform@v3
@@ -112,22 +89,22 @@ jobs:
       # Terraform Plan
       # --------------------------------------------------
       - name: Terraform Init
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform init -input=false -lock=false
 
       - name: Terraform Plan
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform plan -out=pr.tfplan -lock=false
 
       - name: Export Plan JSON
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: terraform show -json pr.tfplan > plan.json
 
       # --------------------------------------------------
       # Run Infracost
       # --------------------------------------------------
       - name: Run Infracost
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           infracost breakdown \
             --path plan.json \
@@ -139,115 +116,93 @@ jobs:
       # --------------------------------------------------
       - name: Enforce monthly cost limit
         id: costgate
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           set -euo pipefail
+
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
           echo "PR monthly cost: $TOTAL USD"
+
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
             echo "❌ Cost exceeds allowed threshold ($MAX_MONTHLY_COST_USD USD)"
             exit 1
           fi
+
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------
       # Build Gemini Prompt
       # --------------------------------------------------
       - name: Build Gemini request
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           set -euo pipefail
-          
-          # Read Infracost JSON and escape for JSON string
-          INFRACOST_JSON=$(jq -c . infracost.json)
-          
-          # Build prompt text
-          PROMPT="You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
 
-          Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
+          INFRACOST_JSON=$(cat infracost.json)
 
-          Treat Infracost as source of truth for direct cost.
-          Additionally identify dependent usage-based billing triggers activated after deployment.
-          Be concise, precise, and technical. No generic advice.
+          cat <<EOF > gemini_prompt.txt
+You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
 
-          For each detected component include:
-          - Direct cost summary (1 line)
-          - Dependent billing surfaces (component | billing unit | trigger | realistic price range)
-          - Concrete Terraform guardrail recommendation
-          - Risk rating (LOW / MEDIUM / HIGH)
+Direct Monthly Cost (authoritative from Infracost): $TOTAL USD.
 
-          Use 2026 pricing anchors when relevant:
-          Egress ~\$0.12/GB
-          Inter-region ~\$0.01-0.08/GB
-          NAT ~\$0.045/hr + ~\$0.045/GB
-          Load Balancer ~\$0.008-0.025/GB
-          Logging ~\$0.50/GB
-          Snapshots ~\$0.026/GB
-          Static IP ~\$0.004/hr
+Treat Infracost as source of truth for direct cost.
+Identify dependent usage-based billing triggers activated after deployment.
+Be concise, precise, and technical.
 
-          Infracost JSON:
-          ${INFRACOST_JSON}"
-          
-          # Create properly formatted JSON request
+For each detected component include:
+- Direct cost summary (1 line)
+- Dependent billing surfaces (component | billing unit | trigger | realistic price range)
+- Concrete Terraform guardrail recommendation
+- Risk rating (LOW / MEDIUM / HIGH)
+
+Use 2026 pricing anchors when relevant:
+Egress ~$0.12/GB
+Inter-region ~$0.01-0.08/GB
+NAT ~$0.045/hr + ~$0.045/GB
+Load Balancer ~$0.008-0.025/GB
+Logging ~$0.50/GB
+Snapshots ~$0.026/GB
+Static IP ~$0.004/hr
+
+Infracost JSON:
+$INFRACOST_JSON
+EOF
+
           jq -n \
-            --arg prompt "$PROMPT" \
-            '{
-              "contents": [{
-                "parts": [{
-                  "text": $prompt
-                }]
-              }]
-            }' > gemini_request.json
+            --rawfile text gemini_prompt.txt \
+            '{ contents: [{ parts: [{ text: $text }] }] }' \
+            > gemini_request.json
 
       # --------------------------------------------------
       # Call Gemini API
       # --------------------------------------------------
       - name: Call Gemini
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          set -euo pipefail
-          
-          # Call Gemini API and save full response
-          RESPONSE=$(curl -sS \
+          curl -sS \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
-            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H "X-goog-api-key: $GEMINI_API_KEY" \
             -X POST \
-            -d @gemini_request.json)
-          
-          # Check if response contains an error
-          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Gemini API Error:"
-            echo "$RESPONSE" | jq '.error'
-            exit 1
-          fi
-          
-          # Extract text from response
-          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "No response from Gemini API"' > gemini.md
-          
-          # Verify we got actual content
-          if [ ! -s gemini.md ] || grep -q "^null$" gemini.md; then
-            echo "❌ No valid response from Gemini"
-            echo "Full API Response:"
-            echo "$RESPONSE" | jq .
-            exit 1
-          fi
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text' \
+            > gemini.md
 
       # --------------------------------------------------
-      # Comment on PR
+      # Comment on PR (SAFE — no printf)
       # --------------------------------------------------
       - name: Comment on PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: ${{ matrix.directory }}
+        working-directory: ${{ steps.tfdir.outputs.dir }}
         run: |
           {
-            echo "## Terraform PR FinOps Review - \`${{ matrix.directory }}\`"
+            echo "## Terraform PR FinOps Review"
             echo ""
-            echo "**Directory:** ${{ matrix.directory }}"
+            echo "**Directory:** ${{ steps.tfdir.outputs.dir }}"
             echo ""
             echo "**Estimated Monthly Cost:** $TOTAL USD"
             echo ""
@@ -255,5 +210,5 @@ jobs:
             echo ""
             cat gemini.md
           } > comment.md
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body-file comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
