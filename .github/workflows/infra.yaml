@@ -2,7 +2,8 @@ name: Terraform PR FinOps Gate
 
 on:
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
     paths:
       - "**/*.tf"
 
@@ -19,47 +20,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # --------------------------------------------------
-      # Checkout PR (Need previous commit for diff)
-      # --------------------------------------------------
-      - name: Checkout
+      # ----------------------------------------
+      # Checkout latest PR commit
+      # ----------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      # --------------------------------------------------
-      # Install dependencies
-      # --------------------------------------------------
-      - name: Install jq & bc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+      # ----------------------------------------
+      # Install required tools
+      # ----------------------------------------
+      - name: Install jq and bc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
 
-      # --------------------------------------------------
-      # Detect Terraform folder from LATEST commit
-      # --------------------------------------------------
-      - name: Detect Terraform directory
+      # ----------------------------------------
+      # Detect Terraform directory from latest commit ONLY
+      # ----------------------------------------
+      - name: Detect changed directory
         id: detect
-        shell: bash
         run: |
           set -euo pipefail
 
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
 
           if [ -z "$CHANGED_FILES" ]; then
-            echo "No Terraform changes in latest commit"
+            echo "No Terraform files changed in latest commit."
             exit 1
           fi
 
           DIR=$(echo "$CHANGED_FILES" | head -n1 | xargs dirname)
-
           echo "Detected directory: $DIR"
+
           echo "dir=$DIR" >> $GITHUB_OUTPUT
 
-      # --------------------------------------------------
+      # ----------------------------------------
       # Authenticate to GCP
-      # --------------------------------------------------
+      # ----------------------------------------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -67,9 +64,9 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
 
-      # --------------------------------------------------
+      # ----------------------------------------
       # Setup Terraform & Infracost
-      # --------------------------------------------------
+      # ----------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -78,9 +75,9 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # --------------------------------------------------
+      # ----------------------------------------
       # Terraform Plan
-      # --------------------------------------------------
+      # ----------------------------------------
       - name: Terraform Init
         working-directory: ${{ steps.detect.outputs.dir }}
         run: terraform init -input=false -lock=false
@@ -93,9 +90,9 @@ jobs:
         working-directory: ${{ steps.detect.outputs.dir }}
         run: terraform show -json plan.tfplan > plan.json
 
-      # --------------------------------------------------
-      # Run Infracost
-      # --------------------------------------------------
+      # ----------------------------------------
+      # Infracost Breakdown
+      # ----------------------------------------
       - name: Run Infracost
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
@@ -104,105 +101,99 @@ jobs:
             --format json \
             --out-file infracost.json
 
-      # --------------------------------------------------
+      # ----------------------------------------
       # Hard Cost Gate
-      # --------------------------------------------------
-      - name: Enforce cost limit
+      # ----------------------------------------
+      - name: Enforce cost threshold
         id: costgate
         working-directory: ${{ steps.detect.outputs.dir }}
-        shell: bash
         run: |
           set -euo pipefail
 
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
 
-          echo "Total Monthly Cost: $TOTAL USD"
+          echo "Estimated Monthly Cost: $TOTAL USD"
 
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "Cost exceeds limit"
+            echo "Cost exceeds allowed threshold."
             exit 1
           fi
 
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-      # --------------------------------------------------
-      # Build Gemini Prompt (HEREDOC SAFE)
-      # --------------------------------------------------
-      - name: Build Gemini request
+      # ----------------------------------------
+      # Build Gemini Prompt (Enterprise-Safe Method)
+      # ----------------------------------------
+      - name: Build Gemini Request
         working-directory: ${{ steps.detect.outputs.dir }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          cat > prompt.txt <<EOF
+          cat <<EOF > prompt.txt
 You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
 
-Direct Monthly Cost (from Infracost): $TOTAL USD.
+Direct Monthly Cost (authoritative from Infracost): $TOTAL USD.
 
-Treat Infracost as authoritative for direct cost.
+Treat Infracost as the source of truth for direct cost.
 Identify dependent usage-based billing triggers activated after deployment.
-Be concise and technical.
+
+Be concise, precise, and technical.
 
 For each detected component include:
 - Direct cost summary (1 line)
-- Dependent billing surfaces (component | billing unit | trigger | price range)
-- Concrete Terraform guardrail
+- Dependent billing surfaces (component | billing unit | trigger | realistic price range)
+- Concrete Terraform guardrail recommendation
 - Risk rating (LOW / MEDIUM / HIGH)
 
-2026 pricing anchors:
-Egress ~0.12 USD/GB
-Inter-region ~0.01-0.08 USD/GB
-NAT ~0.045 USD/hr + 0.045 USD/GB
-Load Balancer ~0.008-0.025 USD/GB
-Logging ~0.50 USD/GB
-Snapshots ~0.026 USD/GB
-Static IP ~0.004 USD/hr
+Use 2026 pricing anchors when relevant:
+Egress ~$0.12/GB
+Inter-region ~$0.01-0.08/GB
+NAT ~$0.045/hr + ~$0.045/GB
+Load Balancer ~$0.008-0.025/GB
+Logging ~$0.50/GB
+Snapshots ~$0.026/GB
+Static IP ~$0.004/hr
 
 Infracost JSON:
-$(cat infracost.json)
 EOF
 
-          jq -n \
-            --rawfile text prompt.txt \
+          cat infracost.json >> prompt.txt
+
+          jq -n --rawfile text prompt.txt \
             '{ contents: [{ parts: [{ text: $text }] }] }' \
             > gemini_request.json
 
-      # --------------------------------------------------
-      # Call Gemini
-      # --------------------------------------------------
+      # ----------------------------------------
+      # Call Gemini API
+      # ----------------------------------------
       - name: Call Gemini
         working-directory: ${{ steps.detect.outputs.dir }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          RESPONSE=$(curl -sS \
+          curl -sS \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini_request.json)
+            -d @gemini_request.json \
+            | jq -r '.candidates[0].content.parts[0].text // "No response"' \
+            > gemini.md
 
-          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "No response"' > gemini.md
-
-      # --------------------------------------------------
+      # ----------------------------------------
       # Comment on PR
-      # --------------------------------------------------
+      # ----------------------------------------
       - name: Comment on PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: ${{ steps.detect.outputs.dir }}
-        shell: bash
         run: |
-          {
-            echo "## 🤖 Terraform PR FinOps Review"
-            echo ""
-            echo "**Directory:** ${{ steps.detect.outputs.dir }}"
-            echo "**Estimated Monthly Cost:** $TOTAL USD"
-            echo ""
-            echo "---"
-            echo ""
-            cat gemini.md
-          } > comment.md
+          echo "## Terraform PR FinOps Review" > comment.md
+          echo "" >> comment.md
+          echo "**Directory:** ${{ steps.detect.outputs.dir }}" >> comment.md
+          echo "**Estimated Monthly Cost:** $TOTAL USD" >> comment.md
+          echo "" >> comment.md
+          echo "---" >> comment.md
+          echo "" >> comment.md
+          cat gemini.md >> comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
