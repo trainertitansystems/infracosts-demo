@@ -33,22 +33,22 @@ jobs:
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || echo "")
           
           if [ -z "$CHANGED_FILES" ]; then
-            echo "❌ No Terraform files changed in the latest commit."
+            echo "No Terraform files changed in the latest commit"
             exit 1
           fi
           
-          echo "Changed .tf files in latest commit:"
+          echo "Changed tf files in latest commit:"
           echo "$CHANGED_FILES"
           
           CHANGED_DIRS=$(echo "$CHANGED_FILES" | xargs -I {} dirname {} | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
           if echo "$CHANGED_DIRS" | jq -e 'any(. == ".")' > /dev/null; then
-            echo "❌ Terraform at repo root is forbidden"
+            echo "Terraform at repo root is forbidden"
             exit 1
           fi
           
           if [ "$CHANGED_DIRS" == "[]" ] || [ "$CHANGED_DIRS" == "null" ]; then
-            echo "❌ No valid directories found."
+            echo "No valid directories found"
             exit 1
           fi
           
@@ -121,26 +121,44 @@ jobs:
           echo "PR monthly cost: $TOTAL USD"
           echo "Limit: $MAX_MONTHLY_COST_USD USD"
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "❌ Cost exceeds allowed threshold"
+            echo "Cost exceeds allowed threshold"
             exit 1
           fi
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-          echo "✅ Cost within allowed limit"
+          echo "Cost within allowed limit"
 
       - name: Build Gemini request
         working-directory: ${{ matrix.directory }}
         run: |
           set -euo pipefail
-          INFRACOST_JSON=$(cat infracost.json | jq -c .)
-          cat > gemini_request.json <<EOF
-{
-  "contents": [{
-    "parts": [{
-      "text": "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.\n\nDirect Monthly Cost (authoritative from Infracost): \$$TOTAL USD.\n\nTreat Infracost as source of truth for direct cost.\nIdentify dependent usage-based billing triggers activated after deployment.\nBe concise, precise, and technical.\n\nFor each detected component include:\n- Direct cost summary (1 line)\n- Dependent billing surfaces (component | billing unit | trigger | realistic price range)\n- Concrete Terraform guardrail recommendation\n- Risk rating (LOW / MEDIUM / HIGH)\n\nUse 2026 pricing anchors when relevant:\nEgress ~\$0.12/GB\nInter-region ~\$0.01-0.08/GB\nNAT ~\$0.045/hr + ~\$0.045/GB\nLoad Balancer ~\$0.008-0.025/GB\nLogging ~\$0.50/GB\nSnapshots ~\$0.026/GB\nStatic IP ~\$0.004/hr\n\nInfracost JSON:\n$INFRACOST_JSON"
-    }]
-  }]
-}
-EOF
+          INFRACOST_JSON=$(jq -c . infracost.json)
+          PROMPT="You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR.
+
+          Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD.
+
+          Treat Infracost as source of truth for direct cost.
+          Identify dependent usage-based billing triggers activated after deployment.
+          Be concise, precise, and technical.
+
+          For each detected component include:
+          - Direct cost summary (1 line)
+          - Dependent billing surfaces (component | billing unit | trigger | realistic price range)
+          - Concrete Terraform guardrail recommendation
+          - Risk rating (LOW / MEDIUM / HIGH)
+
+          Use 2026 pricing anchors when relevant:
+          Egress ~\$0.12/GB
+          Inter-region ~\$0.01-0.08/GB
+          NAT ~\$0.045/hr + ~\$0.045/GB
+          Load Balancer ~\$0.008-0.025/GB
+          Logging ~\$0.50/GB
+          Snapshots ~\$0.026/GB
+          Static IP ~\$0.004/hr
+
+          Infracost JSON:
+          ${INFRACOST_JSON}"
+          
+          jq -n --arg text "$PROMPT" '{"contents":[{"parts":[{"text":$text}]}]}' > gemini_request.json
 
       - name: Call Gemini API
         working-directory: ${{ matrix.directory }}
@@ -148,21 +166,15 @@ EOF
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
-          RESPONSE=$(curl -sS \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d @gemini_request.json)
-          
+          RESPONSE=$(curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" -H "Content-Type: application/json" -d @gemini_request.json)
           if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Gemini API Error:"
+            echo "Gemini API Error:"
             echo "$RESPONSE" | jq '.error'
             exit 1
           fi
-          
           echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "No response"' > gemini.md
-          
           if [ ! -s gemini.md ] || grep -q "^null$" gemini.md; then
-            echo "❌ No valid response from Gemini"
+            echo "No valid response from Gemini"
             exit 1
           fi
 
@@ -171,14 +183,14 @@ EOF
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: ${{ matrix.directory }}
         run: |
-          {
-            echo "## 🤖 Terraform PR FinOps Review - \`${{ matrix.directory }}\`"
-            echo ""
-            echo "**Directory:** \`${{ matrix.directory }}\`"
-            echo "**Estimated Monthly Cost:** \$${TOTAL} USD"
-            echo ""
-            echo "---"
-            echo ""
-            cat gemini.md
-          } > comment.md
+          cat > comment.md << 'COMMENT_EOF'
+          ## 🤖 Terraform PR FinOps Review - `${{ matrix.directory }}`
+
+          **Directory:** `${{ matrix.directory }}`
+          **Estimated Monthly Cost:** $${TOTAL} USD
+
+          ---
+
+          COMMENT_EOF
+          cat gemini.md >> comment.md
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
