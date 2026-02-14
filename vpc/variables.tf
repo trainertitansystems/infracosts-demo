@@ -1,3 +1,4 @@
+#india is my country
 #variables
 variable "project_id" {
   type = string
