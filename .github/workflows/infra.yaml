@@ -1,151 +1,138 @@
-name: Terraform PR FinOps Gate
-
-on:
+name: Terraform PR FinOps Review (Latest Commit Multi-Module)
+'on':
   pull_request:
     branches:
       - main
-    paths:
-      - "infracost/**/*.tf"
-
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
-env:
-  MAX_MONTHLY_COST_USD: "50"
-
 jobs:
-  finops:
+  detect:
     runs-on: ubuntu-latest
-
+    outputs:
+      matrix: '${{ steps.set.outputs.matrix }}'
+      empty: '${{ steps.set.outputs.empty }}'
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-
-      - name: Install dependencies
+      - id: set
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+          set -e
 
-      - name: Verify latest commit modifies infracost
-        run: |
-          set -euo pipefail
-          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+          echo "Checking latest commit..."
 
-          if [ -z "$CHANGED" ]; then
-            echo "No Terraform files changed in latest commit."
-            exit 1
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+
+          TF_FILES=$(echo "$CHANGED" | grep '^infracost/.*\.tf$' || true)
+
+          if [ -z "$TF_FILES" ]; then
+            echo "No Terraform changes in latest commit."
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          if ! echo "$CHANGED" | grep -q '^infracost/'; then
-            echo "Latest commit does not modify infracost root."
-            exit 1
-          fi
+          echo "Terraform files changed:"
+          echo "$TF_FILES"
 
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+          ROOTS=$(echo "$TF_FILES" | awk -F/ '{
+            if (NF==2) print "infracost";
+            else print $1"/"$2
+          }' | sort -u)
+
+          JSON=$(printf '%s\n' "$ROOTS" | jq -R -s -c 'split("\n")[:-1]')
+
+          echo "Detected modules:"
+          echo "$JSON"
+
+          echo "empty=false" >> $GITHUB_OUTPUT
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
+  finops:
+    needs: detect
+    if: needs.detect.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: '${{ fromJson(needs.detect.outputs.matrix) }}'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Setup Infracost
-        uses: infracost/actions/setup@v3
+      - uses: hashicorp/setup-terraform@v3
+      - uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Clean old files
+        run: |
+          rm -f ${{ matrix.module }}/plan.tfplan
+          rm -f ${{ matrix.module }}/plan.json
+          rm -f ${{ matrix.module }}/infracost.json
       - name: Terraform Init
-        working-directory: infracost
+        working-directory: '${{ matrix.module }}'
         run: terraform init -input=false -lock=false
-
       - name: Terraform Plan
-        working-directory: infracost
+        working-directory: '${{ matrix.module }}'
         run: terraform plan -out=plan.tfplan -input=false -lock=false
-
-      - name: Export plan JSON
-        working-directory: infracost
+      - name: Export Plan JSON
+        working-directory: '${{ matrix.module }}'
         run: terraform show -json plan.tfplan > plan.json
-
       - name: Run Infracost
-        working-directory: infracost
+        working-directory: '${{ matrix.module }}'
         run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
+      - name: Extract cost
+        id: cost
+        working-directory: '${{ matrix.module }}'
+        run: >
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
+          // 0' infracost.json)
 
-      - name: Enforce cost threshold
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+      - name: Build Gemini request
+        working-directory: '${{ matrix.module }}'
         run: |
-          set -euo pipefail
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost/infracost.json)
-
-          echo "Estimated Monthly Cost: $TOTAL USD"
-
-          if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
-            echo "Cost exceeds allowed threshold"
-            exit 1
-          fi
-
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-      - name: Build Gemini Request
-        run: |
-          set -euo pipefail
-
-          echo "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR." > prompt.txt
-          echo "" >> prompt.txt
-          echo "Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD." >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Treat Infracost as source of truth." >> prompt.txt
-          echo "Identify dependent usage-based billing triggers activated after deployment." >> prompt.txt
-          echo "Be concise, precise, and technical." >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Include:" >> prompt.txt
-          echo "- Direct cost summary" >> prompt.txt
-          echo "- Dependent billing surfaces (component | billing unit | trigger | realistic price range)" >> prompt.txt
-          echo "- Terraform guardrail recommendation" >> prompt.txt
-          echo "- Risk rating (LOW / MEDIUM / HIGH)" >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Infracost JSON:" >> prompt.txt
-
-          cat infracost/infracost.json >> prompt.txt
-
-          jq -n --rawfile text prompt.txt \
-            '{ contents: [{ parts: [{ text: $text }] }] }' \
-            > gemini_request.json
-
+          jq -n \
+            --argjson cost "$(cat infracost.json)" \
+            --arg total "${{ steps.cost.outputs.total }}" \
+            '{
+              contents: [{
+                role: "user",
+                parts: [{
+                  text:
+                    "Terraform Module: '${{ matrix.module }}'\n\n" +
+                    "Estimated Monthly Cost: $" + $total + " USD\n\n" +
+                    "Provide:\n" +
+                    "- Cost summary\n" +
+                    "- Cost drivers\n" +
+                    "- Optimization suggestions\n" +
+                    "- Architecture risks\n\n" +
+                    "INFRACOST DATA:\n" + ($cost | tostring)
+                }]
+              }]
+            }' > gemini.json
       - name: Call Gemini
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+        working-directory: '${{ matrix.module }}'
         run: |
-          set -euo pipefail
-
-          curl -sS \
+          curl -s \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @gemini_request.json \
-          | jq -r '.candidates[0].content.parts[0].text // "No response"' \
-          > gemini.md
-
+            -d @gemini.json \
+            | jq -r '.candidates[0].content.parts[0].text // "No response"' \
+            > gemini.md
       - name: Comment on PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          {
-            echo "## 🤖 Terraform PR FinOps Review"
-            echo ""
-            echo "**Terraform Root:** infracost/"
-            echo "**Estimated Monthly Cost:** ${TOTAL} USD"
-            echo ""
-            echo "---"
-            echo ""
-            cat gemini.md
-          } > comment.md
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        working-directory: '${{ matrix.module }}'
+        run: "{\n  echo \"## \U0001F916 FinOps Review — ${{ matrix.module }}\"\n  echo \"\"\n  echo \"**Estimated Monthly Cost:** ${{ steps.cost.outputs.total }} USD\"\n  echo \"\"\n  echo \"---\"\n  echo \"\"\n  cat gemini.md\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
