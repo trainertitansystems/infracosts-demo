@@ -26,10 +26,13 @@ jobs:
           fetch-depth: 2
 
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc
 
       - name: Verify latest commit modifies infracost
         run: |
+          set -euo pipefail
           CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
 
           if [ -z "$CHANGED" ]; then
@@ -71,11 +74,17 @@ jobs:
 
       - name: Run Infracost
         working-directory: infracost
-        run: infracost breakdown --path plan.json --format json --out-file infracost.json
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
 
       - name: Enforce cost threshold
         run: |
+          set -euo pipefail
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost/infracost.json)
+
           echo "Estimated Monthly Cost: $TOTAL USD"
 
           if (( $(echo "$TOTAL > $MAX_MONTHLY_COST_USD" | bc -l) )); then
@@ -87,19 +96,21 @@ jobs:
 
       - name: Build Gemini Request
         run: |
+          set -euo pipefail
+
           echo "You are a Principal FinOps Cloud Architect performing a Shadow Cost review for a Google Cloud Terraform PR." > prompt.txt
           echo "" >> prompt.txt
           echo "Direct Monthly Cost (authoritative from Infracost): ${TOTAL} USD." >> prompt.txt
           echo "" >> prompt.txt
           echo "Treat Infracost as source of truth." >> prompt.txt
-          echo "Identify dependent usage-based billing triggers." >> prompt.txt
-          echo "Be concise and technical." >> prompt.txt
+          echo "Identify dependent usage-based billing triggers activated after deployment." >> prompt.txt
+          echo "Be concise, precise, and technical." >> prompt.txt
           echo "" >> prompt.txt
           echo "Include:" >> prompt.txt
           echo "- Direct cost summary" >> prompt.txt
-          echo "- Dependent billing surfaces" >> prompt.txt
+          echo "- Dependent billing surfaces (component | billing unit | trigger | realistic price range)" >> prompt.txt
           echo "- Terraform guardrail recommendation" >> prompt.txt
-          echo "- Risk rating" >> prompt.txt
+          echo "- Risk rating (LOW / MEDIUM / HIGH)" >> prompt.txt
           echo "" >> prompt.txt
           echo "Infracost JSON:" >> prompt.txt
 
@@ -113,12 +124,14 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          set -euo pipefail
+
           curl -sS \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @gemini_request.json \
-            | jq -r '.candidates[0].content.parts[0].text // "No response"' \
-            > gemini.md
+          | jq -r '.candidates[0].content.parts[0].text // "No response"' \
+          > gemini.md
 
       - name: Comment on PR
         env:
