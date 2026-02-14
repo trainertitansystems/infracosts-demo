@@ -1,4 +1,3 @@
-#testing the cost-----
 terraform {
   required_providers {
     google = {
