@@ -18,15 +18,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -42,39 +40,34 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Detect changed Terraform directories (latest commit only)
+      - name: Detect changed Terraform modules
         id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
 
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
+          MODULES=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep '\.tf$' \
+            | xargs -r -n1 dirname \
+            | sort -u)
 
-          if [ -z "$CHANGED" ]; then
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
-            exit 0
+          if [ -z "$MODULES" ]; then
+            echo "NO_MODULES=true" >> $GITHUB_ENV
+          else
+            echo "MODULES=$MODULES" >> $GITHUB_ENV
           fi
 
-          DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-          echo "MODULES=$(echo $DIRS)" >> $GITHUB_ENV
-
-      - name: Run FinOps Analysis
-        if: env.NO_CHANGES != 'true'
+      - name: Run FinOps per module
+        if: env.NO_MODULES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-
           for module in $MODULES; do
-
-            echo "------------------------------------"
             echo "Processing module: $module"
-            echo "------------------------------------"
 
             cd "$module"
-
-            rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt gemini_request.json
 
             terraform init -input=false
             terraform plan -out=plan.tfplan -input=false
@@ -86,25 +79,22 @@ jobs:
               --out-file infracost.json
 
             TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-
-            SUMMARY=$(jq -r '
-              .projects[].breakdown.resources[] |
-              "\(.name) | $\(.monthlyCost)"
-            ' infracost.json | head -n 20)
-
             echo "Total monthly cost: $TOTAL"
 
-            # Build compact Gemini prompt (NO full JSON injection)
+            SUMMARY=$(jq -r '
+              .projects[].breakdown.resources[]? |
+              "\(.name) | \(.monthlyCost)"
+            ' infracost.json | head -n 30)
+
             printf "ROLE: Senior GCP FinOps Architect (2026 Specialist)\n\n" > prompt.txt
-            printf "Analyze direct and hidden GCP cost exposure.\n\n" >> prompt.txt
             printf "Module: %s\n" "$module" >> prompt.txt
             printf "Direct Monthly Cost: %s USD\n\n" "$TOTAL" >> prompt.txt
-            printf "Resource Summary:\n%s\n\n" "$SUMMARY" >> prompt.txt
-            printf "If direct cost is 0, analyze shadow costs:\n" >> prompt.txt
-            printf "- Cloud NAT (0.045 USD/GB)\n" >> prompt.txt
-            printf "- Inter-zone egress (0.01 USD/GB)\n" >> prompt.txt
-            printf "- Log ingestion (0.50 USD/GiB)\n" >> prompt.txt
-            printf "- Load balancer processing (0.008 USD/GB)\n\n" >> prompt.txt
+            printf "Resources Summary:\n%s\n\n" "$SUMMARY" >> prompt.txt
+            printf "If direct cost is 0, analyze usage-based shadow costs:\n" >> prompt.txt
+            printf -- "- Cloud NAT (0.045 USD/GB)\n" >> prompt.txt
+            printf -- "- Inter-zone egress (0.01 USD/GB)\n" >> prompt.txt
+            printf -- "- Log ingestion (0.50 USD/GiB)\n" >> prompt.txt
+            printf -- "- Load balancer processing (0.008 USD/GB)\n\n" >> prompt.txt
             printf "Return markdown tables only.\n" >> prompt.txt
 
             jq -n --rawfile text prompt.txt \
@@ -123,23 +113,23 @@ jobs:
               elif .error then
                 "Gemini API Error: " + .error.message
               else
-                "Unknown Gemini Response"
+                "Unknown Gemini response"
               end
-            ' > gemini.md
+            ' > gemini_output.txt
 
             cd -
 
             {
               printf "## 💰 FinOps Audit: %s\n\n" "$module"
               printf "| Field | Value |\n"
-              printf "| :--- | :--- |\n"
-              printf "| Direct Monthly Cost | $%s USD |\n\n" "$TOTAL"
-              printf "---\n"
+              printf "|------|-------|\n"
+              printf "| Direct Monthly Cost | \$%s USD |\n\n" "$TOTAL"
               printf "## 🤖 Gemini Architect Review\n\n"
-              cat "$module/gemini.md"
+              cat "$module/gemini_output.txt"
               printf "\n\nGenerated via Gemini 2.0 Flash + Infracost\n"
             } > comment.md
 
             gh pr comment "$PR_NUMBER" --body-file comment.md
 
+            rm -f comment.md
           done
