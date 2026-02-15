@@ -2,42 +2,59 @@
 set -euo pipefail
 
 MODULE=$1
-ROOT_DIR=$(pwd)
-TOTAL=$(cat "$ROOT_DIR/.total_cost")
 
-# 1. Build the prompt string SAFELY using jq
-# This replaces the 'cat <<EOF' method which was causing the JSON errors.
-PROMPT_HEADER="You are a Senior GCP FinOps Architect. Analyze this Terraform cost breakdown for module: $MODULE."
-PROMPT_METRICS="Total Monthly Cost: \$$TOTAL USD. Instructions: suggest Spot/CUD if cost > 0, otherwise highlight shadow costs."
+cd "$MODULE"
 
-# Use jq to merge the strings and the file content into a single JSON request
-jq -n \
-  --arg header "$PROMPT_HEADER" \
-  --arg metrics "$PROMPT_METRICS" \
-  --rawfile data "$ROOT_DIR/.infracost.json" \
-  '{
-    contents: [{
-      parts: [{
-        text: ($header + "\n" + $metrics + "\n\nRAW DATA:\n" + $data)
-      }]
-    }]
-  }' > "$ROOT_DIR/gemini_request.json"
+if [ ! -f "infracost.json" ]; then
+  echo "Missing infracost.json in $MODULE"
+  exit 1
+fi
 
-# 2. POST to Gemini API
+# Extract total
+TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
+# Extract compact resource summary
+SUMMARY=$(jq -r '
+  .projects[].breakdown.resources[]? |
+  "\(.name) | \(.monthlyCost)"
+' infracost.json | head -n 25)
+
+# Build safe prompt (NO RAW JSON)
+cat > prompt.txt <<EOF
+ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
+
+Module: ${MODULE}
+Direct Monthly Cost: ${TOTAL} USD
+
+Resources:
+${SUMMARY}
+
+If direct cost is 0, analyze usage-based shadow costs:
+- Cloud NAT processing (0.045 USD/GB)
+- Inter-zone egress (0.01 USD/GB)
+- Logging ingestion (0.50 USD/GiB)
+- Load balancer processing (0.008 USD/GB)
+
+Return markdown tables only.
+EOF
+
+# Convert to safe JSON
+jq -Rs '{contents:[{parts:[{text:.}]}]}' prompt.txt > gemini_request.json
+
 RESPONSE=$(curl -sS -X POST \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "Content-Type: application/json" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-  --data-binary @"$ROOT_DIR/gemini_request.json")
+  --data-binary @gemini_request.json)
 
-# 3. Extract AI text or handle API errors
-AI_RESULT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+echo "$RESPONSE" | jq -r '
+  if .candidates then
+    .candidates[0].content.parts[0].text
+  elif .error then
+    "Gemini API Error: " + .error.message
+  else
+    "Unknown Gemini Response"
+  end
+' > .gemini_output
 
-if [ -z "$AI_RESULT" ]; then
-    # Capture detailed error from Google if it fails
-    ERR_MSG=$(echo "$RESPONSE" | jq -r '.error.message // "Unknown API Error"')
-    echo "❌ API Error Details: $ERR_MSG" >&2
-    echo "⚠️ **FinOps Analysis Error**: $ERR_MSG" > "$ROOT_DIR/.gemini_output"
-else
-    echo "$AI_RESULT" > "$ROOT_DIR/.gemini_output"
-fi
+echo "Gemini completed for module: $MODULE"
