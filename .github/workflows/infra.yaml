@@ -1,28 +1,23 @@
 name: Terraform PR FinOps Gate
-
-on:
+'on':
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
-
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      modules: ${{ steps.detect.outputs.modules }}
-
+      modules: '${{ steps.detect.outputs.modules }}'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -40,45 +35,39 @@ jobs:
           JSON=$(printf '%s\n' $DIRS | jq -R . | jq -s -c .)
 
           echo "modules=$JSON" >> "$GITHUB_OUTPUT"
-
   finops:
     needs: detect
-    if: needs.detect.outputs.modules != '[]'
+    if: 'needs.detect.outputs.modules != ''[]'''
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
-        module: ${{ fromJson(needs.detect.outputs.modules) }}
-
+        module: '${{ fromJson(needs.detect.outputs.modules) }}'
     steps:
       - uses: actions/checkout@v4
-
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
-
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
       - name: Setup Infracost CLI
         uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
       - name: Run Terraform + Infracost
-        run: bash scripts/run-terraform.sh "${{ matrix.module }}"
-
+        run: 'bash scripts/run-terraform.sh "${{ matrix.module }}"'
       - name: Run Gemini
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: bash scripts/run-gemini.sh "${{ matrix.module }}"
-
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+        run: 'bash scripts/run-gemini.sh "${{ matrix.module }}"'
       - name: Post PR Comment
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash scripts/post-comment.sh "${{ matrix.module }}" "${{ github.event.pull_request.number }}"
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: >-
+          bash scripts/post-comment.sh "${{ matrix.module }}" "${{
+          github.event.pull_request.number }}"
+
