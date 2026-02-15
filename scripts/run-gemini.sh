@@ -13,31 +13,28 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
   exit 1
 fi
 
+ROOT_DIR="$(pwd)"
 cd "$MODULE"
 
 if [ ! -f infracost.json ]; then
-  echo "Missing infracost.json in module $MODULE"
+  echo "Missing infracost.json in $MODULE"
   exit 1
 fi
 
-# Read total cost from root (written by run-terraform.sh)
-if [ ! -f ../.total_cost ]; then
-  echo "Missing total cost file"
+if [ ! -f "$ROOT_DIR/.total_cost" ]; then
+  echo "Missing .total_cost in root"
   exit 1
 fi
 
-TOTAL=$(cat ../.total_cost)
+TOTAL=$(cat "$ROOT_DIR/.total_cost")
 
-# Extract resource types safely
 RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json 2>/dev/null | sort -u | tr '\n' ', ' || echo "Unknown")
 
-# Build compact cost summary
 SUMMARY=$(jq -r '
   .projects[].breakdown.resources[] |
   "\(.name) | \(.monthlyCost)"
 ' infracost.json | head -n 50)
 
-# Build prompt safely
 cat > prompt.txt <<EOF
 ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
 
@@ -57,19 +54,16 @@ If direct cost is 0, analyze usage-based shadow costs:
 Return markdown tables only.
 EOF
 
-# Convert to valid Gemini JSON payload
 jq -n --rawfile text prompt.txt \
   '{contents:[{parts:[{text:$text}]}]}' \
   > gemini_request.json
 
-# Call Gemini API
 RESPONSE=$(curl -sS -X POST \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "Content-Type: application/json" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
   --data-binary @gemini_request.json)
 
-# Parse response safely
 echo "$RESPONSE" | jq -r '
   if .candidates then
     .candidates[0].content.parts[0].text
@@ -78,6 +72,6 @@ echo "$RESPONSE" | jq -r '
   else
     "Unknown Gemini Response"
   end
-' > ../.gemini_output
+' > "$ROOT_DIR/.gemini_output"
 
 echo "Gemini completed for module: $MODULE"
