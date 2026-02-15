@@ -1,122 +1,160 @@
 name: Terraform PR FinOps Gate
-
-on:
+'on':
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
-
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
 jobs:
   finops:
+    name: Terraform Cost + Gemini Review
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
-
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
-
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
-      - name: Setup Infracost
+      - name: Setup Infracost CLI
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-
       - name: Detect changed module
         id: detect
-        run: |
+        run: >
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
+
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          FILE=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$' | head -n 1)
 
-          if [ -z "$FILE" ]; then
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$'
+          || true)
+
+
+          if [ -z "$CHANGED" ]; then
             echo "No Terraform changes detected"
             exit 0
           fi
 
-          DIR=$(dirname "$FILE")
 
-          if [ "$DIR" = "." ]; then
-            echo "MODULE=." >> $GITHUB_ENV
-          else
-            echo "MODULE=$DIR" >> $GITHUB_ENV
+          DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
+
+          COUNT=$(echo "$DIRS" | wc -l | tr -d ' ')
+
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo "Multiple Terraform modules changed:"
+            echo "$DIRS"
+            exit 1
           fi
 
-      - name: Run Terraform + Infracost
-        run: |
+
+          MODULE="$DIRS"
+
+          echo "MODULE=$MODULE" >> $GITHUB_ENV
+      - name: Terraform Plan + Infracost
+        run: >
           cd "$MODULE"
 
+
+          rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt
+          gemini_request.json
+
+
           terraform init -input=false
+
           terraform plan -out=plan.tfplan -input=false
+
           terraform show -json plan.tfplan > plan.json
+
 
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
+          // 0' infracost.json)
+
 
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+      - name: Build Gemini Prompt
+        run: >
+          cd "$MODULE"
 
-          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ', ')
-          echo "RESOURCES=$RESOURCE_TYPES" >> $GITHUB_ENV
 
-      - name: Generate Recommendation
+          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u
+          | tr '\n' ', ')
+
+
+          echo "You are a GCP FinOps Architect." > prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Module: $MODULE" >> prompt.txt
+
+          echo "Direct Monthly Cost: $TOTAL USD" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Resources Detected: $RESOURCE_TYPES" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Instructions:" >> prompt.txt
+
+          echo "- If fixed cost resources exist, suggest cheaper machine types
+          (e2-micro, e2-small, Spot VMs, preemptible, smaller disks)." >>
+          prompt.txt
+
+          echo "- If usage-based resources exist (VPC, PubSub, Load Balancer,
+          Cloud NAT, Storage), explain shadow costs dynamically." >> prompt.txt
+
+          echo "- Never just say zero. Explain cost exposure." >> prompt.txt
+
+          echo "- Keep output concise and technical." >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Infracost JSON:" >> prompt.txt
+
+          cat infracost.json >> prompt.txt
+
+
+          jq -n --rawfile text prompt.txt \
+            '{contents:[{parts:[{text:$text}]}]}' \
+            > gemini_request.json
+      - name: Call Gemini API
         run: |
-          COST=$(printf "%.2f" "$TOTAL")
+          cd "$MODULE"
 
-          if (( $(echo "$COST > 0" | bc -l) )); then
-            RECOMMENDATION="Fixed monthly cost detected. Consider right-sizing instances or using committed/spot options to reduce cost."
-          else
-            if echo "$RESOURCES" | grep -qi "compute"; then
-              RECOMMENDATION="Usage-based exposure: compute networking, egress, logging, scaling."
-            elif echo "$RESOURCES" | grep -qi "pubsub"; then
-              RECOMMENDATION="Usage-based exposure: message volume, data egress, subscription delivery traffic."
-            elif echo "$RESOURCES" | grep -qi "network"; then
-              RECOMMENDATION="Usage-based exposure: ingress, egress, NAT processing, load balancer traffic."
+          RESPONSE=$(curl -sS -X POST \
+            https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \
+            -H "Content-Type: application/json" \
+            -H "x-goog-api-key: ${{ secrets.GEMINI_API_KEY }}" \
+            --data-binary @gemini_request.json)
+
+          echo "$RESPONSE" | jq -r '
+            if .candidates then
+              .candidates[0].content.parts[0].text
             else
-              RECOMMENDATION="Usage-based costs may apply depending on traffic, storage, and API usage."
-            fi
-          fi
-
-          echo "RECOMMENDATION=$RECOMMENDATION" >> $GITHUB_ENV
-
+              "Gemini API Error"
+            end
+          ' > gemini.md
       - name: Comment on PR
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: |
-          {
-            echo "## 💰 FinOps Audit: $MODULE"
-            echo ""
-            echo "| Field | Value |"
-            echo "|:------|:------|"
-            echo "| Direct Monthly Cost | \$${TOTAL} USD |"
-            echo ""
-            echo "## 🤖 AI Recommendation"
-            echo ""
-            echo "- $RECOMMENDATION"
-            echo ""
-            echo "---"
-            echo "_Generated via Infracost_"
-          } > comment.md
-
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+        run: "cd \"$MODULE\"\n\necho \"## \U0001F4B0 FinOps Audit: $MODULE\" > comment.md\necho \"\" >> comment.md\necho \"| Field | Value |\" >> comment.md\necho \"|-------|-------|\" >> comment.md\necho \"| Direct Monthly Cost | \\$$TOTAL USD |\" >> comment.md\necho \"\" >> comment.md\necho \"## \U0001F916 AI Recommendation\" >> comment.md\necho \"\" >> comment.md\ncat gemini.md >> comment.md\necho \"\" >> comment.md\necho \"_Generated via Infracost + Gemini 2.0 Flash_\" >> comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
