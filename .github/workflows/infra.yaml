@@ -10,42 +10,18 @@ permissions:
   pull-requests: write
   id-token: write
 jobs:
-  detect:
+  finops:
+    name: Terraform Cost + Gemini Review
     runs-on: ubuntu-latest
-    outputs:
-      modules: '${{ steps.detect.outputs.modules }}'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: detect
-        run: |
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
-
-          if [ -z "$CHANGED" ]; then
-            echo "modules=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-
-          JSON=$(printf '%s\n' $DIRS | jq -R . | jq -s -c .)
-
-          echo "modules=$JSON" >> "$GITHUB_OUTPUT"
-  finops:
-    needs: detect
-    if: 'needs.detect.outputs.modules != ''[]'''
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        module: '${{ fromJson(needs.detect.outputs.modules) }}'
-    steps:
-      - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -58,16 +34,47 @@ jobs:
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Run Terraform + Infracost
-        run: 'bash scripts/run-terraform.sh "${{ matrix.module }}"'
-      - name: Run Gemini
+      - name: Detect changed Terraform modules
+        id: detect
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          MODULES=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
+          echo "Detected modules:"
+          echo "$MODULES"
+
+          echo "MODULES<<EOF" >> $GITHUB_ENV
+          echo "$MODULES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      - name: Run FinOps scripts per module
+        if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-        run: 'bash scripts/run-gemini.sh "${{ matrix.module }}"'
-      - name: Post PR Comment
-        env:
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: >-
-          bash scripts/post-comment.sh "${{ matrix.module }}" "${{
-          github.event.pull_request.number }}"
+        run: |
+          for module in $MODULES; do
+            echo "-------------------------------------"
+            echo "Processing module: $module"
+            echo "-------------------------------------"
 
+            # Root module fix
+            if [ "$module" = "." ]; then
+              MODULE_PATH="."
+            else
+              MODULE_PATH="$module"
+            fi
+
+            bash scripts/run-terraform.sh "$MODULE_PATH"
+            bash scripts/run-gemini.sh "$MODULE_PATH"
+            bash scripts/post-comment.sh "$MODULE_PATH" "$PR_NUMBER"
+
+          done
