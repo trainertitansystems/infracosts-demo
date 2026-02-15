@@ -1,49 +1,84 @@
 name: Terraform PR FinOps Gate
-'on':
+
+on:
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
+
 permissions:
   contents: read
   pull-requests: write
   id-token: write
+
 jobs:
   finops:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
-      - uses: google-github-actions/auth@v2
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: >-
-            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-      - uses: hashicorp/setup-terraform@v3
-      - uses: infracost/actions/setup@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
         with:
-          api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Detect changed Terraform folders
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Detect changed modules (latest commit in PR)
         id: detect
-        run: >
+        run: |
           BASE="${{ github.event.pull_request.base.sha }}"
-
           HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {} dirname {} | sort -u || true)
 
-          git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {}
-          dirname {} | sort -u > modules.txt || true
-
-
-          if [ ! -s modules.txt ]; then
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          if [ -z "$CHANGED" ]; then
+            echo "modules=" >> $GITHUB_OUTPUT
+          else
+            echo "modules=$(echo $CHANGED)" >> $GITHUB_OUTPUT
           fi
-      - name: Run FinOps Review
-        if: env.NO_CHANGES != 'true'
+
+      - name: Run FinOps per module
+        if: steps.detect.outputs.modules != ''
         env:
-          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-          PR_NUMBER: '${{ github.event.pull_request.number }}'
-        run: "while read module; do\n\n  echo \"Processing $module\"\n  cd \"$module\"\n\n  terraform init -input=false\n  terraform plan -out=plan.tfplan -input=false\n  terraform show -json plan.tfplan > plan.json\n\n  infracost breakdown --path plan.json --format json --out-file infracost.json\n\n  TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n  SUMMARY=$(jq -r '.projects[].breakdown.resources[] | \"\\(.name) - \\(.monthlyCost) USD\"' infracost.json | head -n 20)\n\n  printf \"Senior GCP FinOps Architect Review\\n\\n\" > prompt.txt\n  printf \"Direct Monthly Cost: %s USD\\n\\n\" \"$TOTAL\" >> prompt.txt\n  printf \"Resources:\\n%s\\n\\n\" \"$SUMMARY\" >> prompt.txt\n  printf \"If cost is 0, analyze shadow costs:\\n\" >> prompt.txt\n  printf \"- NAT processing 0.045 USD per GB\\n\" >> prompt.txt\n  printf \"- Inter-zone egress 0.01 USD per GB\\n\" >> prompt.txt\n  printf \"- Logging ingestion 0.50 USD per GiB\\n\" >> prompt.txt\n  printf \"- Load balancer processing 0.008 USD per GB\\n\" >> prompt.txt\n  printf \"Return markdown tables only.\\n\" >> prompt.txt\n\n  jq -n --rawfile text prompt.txt '{contents:[{parts:[{text:$text}]}]}' > gemini_request.json\n\n  RESPONSE=$(curl -sS -X POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \\\n    -H \"Content-Type: application/json\" \\\n    -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n    --data-binary @gemini_request.json)\n\n  echo \"$RESPONSE\" | jq -r 'if .candidates then .candidates[0].content.parts[0].text else \"Gemini Error\" end' > gemini.md\n\n  printf \"## \U0001F4B0 FinOps Audit: %s\\n\\n\" \"$module\" > comment.md\n  printf \"| Field | Value |\\n|-------|-------|\\n| Direct Monthly Cost | \\$%s USD |\\n\\n\" \"$TOTAL\" >> comment.md\n  printf \"---\\n\\n## \U0001F916 Gemini Review\\n\\n\" >> comment.md\n  cat gemini.md >> comment.md\n  printf \"\\n\\n_Generated via Gemini 2.0 Flash + Infracost_\\n\" >> comment.md\n\n  gh pr comment \"$PR_NUMBER\" --body-file comment.md\n\n  cd ..\n\ndone < modules.txt\n"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/run-module.sh
+
+          for module in ${{ steps.detect.outputs.modules }}; do
+            RESULT=$(bash scripts/run-module.sh "$module")
+            MODULE_NAME=$(echo "$RESULT" | cut -d '|' -f1)
+            TOTAL=$(echo "$RESULT" | cut -d '|' -f2)
+
+            COMMENT_FILE="comment_${MODULE_NAME}.md"
+
+            echo "## 💰 FinOps Audit: ${MODULE_NAME}" > $COMMENT_FILE
+            echo "" >> $COMMENT_FILE
+            echo "| Field | Value |" >> $COMMENT_FILE
+            echo "| :--- | :--- |" >> $COMMENT_FILE
+            echo "| Direct Monthly Cost | \$${TOTAL} USD |" >> $COMMENT_FILE
+            echo "" >> $COMMENT_FILE
+            echo "---" >> $COMMENT_FILE
+            echo "## 🤖 Gemini Review" >> $COMMENT_FILE
+            echo "" >> $COMMENT_FILE
+
+            cat ${MODULE_NAME}/gemini_output.md >> $COMMENT_FILE
+
+            gh pr comment $PR_NUMBER --body-file $COMMENT_FILE
+          done
