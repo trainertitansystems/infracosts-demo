@@ -1,14 +1,40 @@
-# Build compact summary
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODULE=$1
+
+cd "$MODULE"
+
+if [ ! -f ".total_cost" ]; then
+  echo "Missing total cost file: $MODULE/.total_cost"
+  exit 1
+fi
+
+if [ ! -f "infracost.json" ]; then
+  echo "Missing infracost.json in $MODULE"
+  exit 1
+fi
+
+TOTAL=$(cat .total_cost)
+
+RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json 2>/dev/null | sort -u | tr '\n' ', ' || true)
+
+# Build compact summary from Infracost
 SUMMARY=$(jq -r '
-  .projects[].breakdown.resources[] |
+  .projects[].breakdown.resources[]? |
   "\(.name) | \(.monthlyCost)"
-' infracost.json | head -n 50)
+' infracost.json | head -n 50 || true)
+
+rm -f .gemini_output
+rm -f gemini_request.json
+rm -f prompt.txt
 
 cat > prompt.txt <<EOF
 ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
 
 Module: ${MODULE}
 Direct Monthly Cost: ${TOTAL} USD
+Resources: ${RESOURCE_TYPES}
 
 Resources Summary:
 ${SUMMARY}
@@ -40,4 +66,6 @@ echo "$RESPONSE" | jq -r '
   else
     "Unknown Gemini Response"
   end
-' > ../.gemini_output
+' > .gemini_output
+
+echo "Gemini analysis completed for module: $MODULE"
