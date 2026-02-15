@@ -41,13 +41,12 @@ jobs:
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
-          # Get directories containing changed .tf files
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {} dirname {} | sort -u || true)
           
           if [ -z "$CHANGED" ]; then
             echo "NO_CHANGES=true" >> $GITHUB_ENV
           else
-            # Save as space-separated list for shell loop
+            # Save as space-separated list for the shell loop
             echo "MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')" >> $GITHUB_ENV
           fi
 
@@ -59,12 +58,13 @@ jobs:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
           chmod +x scripts/*.sh
-          # Use shell variable $MODULE_LIST to avoid context access warnings
+          # Use shell variable $MODULE_LIST to avoid context warnings
           for module in $MODULE_LIST; do
-            echo "Processing module: $module"
+            echo "--- Processing Module: $module ---"
             ./scripts/run-terraform.sh "$module"
             ./scripts/run-gemini.sh "$module"
             ./scripts/post-comment.sh "$module" "$PR_NUMBER"
-            # Cleanup temp files between modules
-            rm -f .total_cost .gemini_output .gemini_error.log gemini_request.json
+            
+            # Clean up artifacts so they don't leak into the next module loop
+            rm -f .total_cost .gemini_output .infracost.json .prompt.txt gemini_request.json
           done
