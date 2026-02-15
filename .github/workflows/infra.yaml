@@ -1,8 +1,11 @@
 name: Terraform PR FinOps Gate
+
 on:
   pull_request:
-    branches: [ main ]
-    paths: [ '**/*.tf' ]
+    branches:
+      - main
+    paths:
+      - '**/*.tf'
 
 permissions:
   contents: read
@@ -11,59 +14,133 @@ permissions:
 
 jobs:
   finops:
-    name: Terraform Cost + Gemini Review
+    name: Latest Commit Cost + Gemini
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
+          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Setup Infracost CLI
+      - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
-          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Detect changed Terraform modules
+      - name: Detect latest commit Terraform folder
         id: detect
         run: |
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {} dirname {} | sort -u || true)
-          
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+
           if [ -z "$CHANGED" ]; then
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
-          else
-            # Save as space-separated list for shell loop
-            echo "MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')" >> $GITHUB_ENV
+            echo "NO_TF=true" >> $GITHUB_ENV
+            exit 0
           fi
 
-      - name: Run FinOps scripts per module
-        if: env.NO_CHANGES != 'true'
-        env:
-          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-          PR_NUMBER: '${{ github.event.pull_request.number }}'
-          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          MODULE=$(echo "$CHANGED" | head -n1 | xargs dirname)
+          echo "MODULE=$MODULE" >> $GITHUB_ENV
+          echo "Detected module: $MODULE"
+
+      - name: Run Terraform + Infracost
+        if: env.NO_TF != 'true'
         run: |
-          chmod +x scripts/*.sh
-          for module in $MODULE_LIST; do
-            echo "--- Processing Module: $module ---"
-            ./scripts/run-terraform.sh "$module"
-            ./scripts/run-gemini.sh "$module"
-            ./scripts/post-comment.sh "$module" "$PR_NUMBER"
-            
-            # Clean up artifacts for next iteration
-            rm -f .total_cost .gemini_output .infracost.json gemini_request.json
-          done
+          cd "$MODULE"
+
+          terraform init -input=false
+          terraform plan -out=plan.tfplan -input=false
+          terraform show -json plan.tfplan > plan.json
+
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
+
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+
+      - name: Run Gemini AI
+        if: env.NO_TF != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cd "$MODULE"
+
+          SUMMARY=$(jq -r '
+            .projects[].breakdown.resources[] |
+            "\(.name) | \(.monthlyCost)"
+          ' infracost.json | head -n 50)
+
+          PROMPT=$(printf "%s\n" \
+            "ROLE: Senior GCP FinOps Architect (2026 Specialist)" \
+            "" \
+            "Module: $MODULE" \
+            "Direct Monthly Cost: $TOTAL USD" \
+            "" \
+            "Resources:" \
+            "$SUMMARY" \
+            "" \
+            "If cost is 0, evaluate shadow costs:" \
+            "- NAT processing (0.045 USD/GB)" \
+            "- Inter-zone egress (0.01 USD/GB)" \
+            "- Logging ingestion (0.50 USD/GiB)" \
+            "- Load balancer processing (0.008 USD/GB)" \
+            "" \
+            "Return markdown tables only."
+          )
+
+          jq -n --arg text "$PROMPT" \
+            '{contents:[{parts:[{text:$text}]}]}' \
+            > gemini_request.json
+
+          RESPONSE=$(curl -sS -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+            -H "Content-Type: application/json" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            --data-binary @gemini_request.json)
+
+          echo "$RESPONSE" | jq -r '
+            if .candidates then
+              .candidates[0].content.parts[0].text
+            elif .error then
+              "Gemini API Error: " + .error.message
+            else
+              "Unknown Gemini response"
+            end
+          ' > gemini.md
+
+      - name: Comment on PR
+        if: env.NO_TF != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 💰 FinOps Audit: $MODULE"
+            echo ""
+            echo "| Field | Value |"
+            echo "| :--- | :--- |"
+            echo "| Direct Monthly Cost | \$${TOTAL} USD |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🤖 Gemini Architect Review"
+            echo ""
+            cat "$MODULE/gemini.md"
+          } > comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
