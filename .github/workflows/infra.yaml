@@ -1,62 +1,102 @@
 name: Terraform PR FinOps Gate
-
-on:
+'on':
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
-
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
 jobs:
   finops:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-
+          fetch-depth: 0
       - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
-
-      - name: Authenticate to GCP
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      - name: Authenticate GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Setup Infracost CLI
-        uses: infracost/actions/setup@v3
+      - uses: hashicorp/setup-terraform@v3
+      - uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
-      - name: Detect latest changed module
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Detect changed module
         id: detect
         run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FILES=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
 
-          if [ -z "$CHANGED" ]; then
-            echo "No Terraform changes detected."
-            exit 0
+          if [ -z "$FILES" ]; then
+            echo "No Terraform changes detected"
+            exit 1
           fi
 
-          MODULE=$(echo "$CHANGED" | head -n1 | xargs dirname)
+          MODULE=$(echo "$FILES" | head -n1 | xargs dirname)
           echo "MODULE=$MODULE" >> $GITHUB_ENV
+      - name: Terraform + Infracost
+        run: >
+          cd "$MODULE"
 
-      - name: Run FinOps Analysis
+
+          terraform init -input=false
+
+          terraform plan -out=plan.tfplan -input=false
+
+          terraform show -json plan.tfplan > plan.json
+
+
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
+
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
+          // 0' infracost.json)
+
+
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+      - name: Gemini Analysis
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          chmod +x scripts/run-module.sh
-          bash scripts/run-module.sh "$MODULE"
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+        run: >
+          cd "$MODULE"
+
+
+          printf "You are a Senior GCP FinOps Architect.\n" > prompt.txt
+
+          printf "Analyze all Terraform resources.\n" >> prompt.txt
+
+          printf "If cost is zero, explain usage-based shadow costs.\n" >>
+          prompt.txt
+
+          printf "Return markdown tables only.\n" >> prompt.txt
+
+
+          jq -n --rawfile text prompt.txt \
+            '{contents:[{parts:[{text:$text}]}]}' \
+            > request.json
+
+          RESPONSE=$(curl -sS -X POST \
+            https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \
+            -H "Content-Type: application/json" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            --data-binary @request.json)
+
+          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text //
+          "Gemini Error"' > gemini.md
+
+
+          cd ..
+      - name: Comment on PR
+        env:
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: "{\n  echo \"## \U0001F4B0 FinOps Audit: $MODULE\"\n  echo \"\"\n  echo \"| Field | Value |\"\n  echo \"|------|------|\"\n  echo \"| Direct Monthly Cost | \\$${TOTAL} USD |\"\n  echo \"\"\n  echo \"## \U0001F916 Gemini Architect Review\"\n  echo \"\"\n  cat \"$MODULE/gemini.md\"\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
