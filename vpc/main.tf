@@ -1,5 +1,3 @@
-#djflkjdljladjflaj
-#adfjladfjhadfhdh
 #laflafaldfhl
 #dfkadfjhadkfkadafjkdfkhdfaf
 #fdajkfhkasfkakfakdfhkahfjk
