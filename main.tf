@@ -1,4 +1,4 @@
-#install
+#get the cost analysis
 terraform {
   required_version = ">= 1.4"
 
