@@ -46,7 +46,7 @@ jobs:
           if [ -z "$CHANGED" ]; then
             echo "NO_CHANGES=true" >> $GITHUB_ENV
           else
-            # Save as space-separated list for the shell loop
+            # Save as space-separated list for shell loop
             echo "MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')" >> $GITHUB_ENV
           fi
 
@@ -58,13 +58,12 @@ jobs:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
           chmod +x scripts/*.sh
-          # Use shell variable $MODULE_LIST to avoid context warnings
           for module in $MODULE_LIST; do
             echo "--- Processing Module: $module ---"
             ./scripts/run-terraform.sh "$module"
             ./scripts/run-gemini.sh "$module"
             ./scripts/post-comment.sh "$module" "$PR_NUMBER"
             
-            # Clean up artifacts so they don't leak into the next module loop
-            rm -f .total_cost .gemini_output .infracost.json .prompt.txt gemini_request.json
+            # Clean up artifacts for next iteration
+            rm -f .total_cost .gemini_output .infracost.json gemini_request.json
           done
