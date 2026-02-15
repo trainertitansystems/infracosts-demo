@@ -1,5 +1,3 @@
-#adfljadfklffjadfadjlf
-#dfadfjafhadkfhjk
 #ajflajfdlajlf
 #install
 terraform {
