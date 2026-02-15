@@ -64,16 +64,23 @@ jobs:
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Generate Terraform Plan & Cost
+      - name: Clean previous artifacts
         working-directory: '${{ matrix.module }}'
         run: >
-          terraform init -input=false
-
-          terraform plan -out=plan.tfplan -input=false
-
-          terraform show -json plan.tfplan > plan.json
-
-
+          rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt
+          gemini_request.json || true
+      - name: Terraform Init
+        working-directory: '${{ matrix.module }}'
+        run: terraform init -input=false
+      - name: Terraform Plan
+        working-directory: '${{ matrix.module }}'
+        run: terraform plan -out=plan.tfplan -input=false
+      - name: Export plan JSON
+        working-directory: '${{ matrix.module }}'
+        run: terraform show -json plan.tfplan > plan.json
+      - name: Run Infracost
+        working-directory: '${{ matrix.module }}'
+        run: >
           infracost breakdown \
             --path plan.json \
             --format json \
@@ -83,39 +90,55 @@ jobs:
           // 0' infracost.json)
 
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
-      - name: Build Gemini Request
+      - name: Build Gemini Prompt
         working-directory: '${{ matrix.module }}'
         run: >
           RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u
           | tr '\n' ', ')
 
-          INFRACOST_JSON=$(jq -c . infracost.json)
+
+          echo "ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)" >
+          prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "TASK: Analyze direct and hidden GCP cost exposure." >>
+          prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "OUTPUT FORMAT: Markdown tables only." >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "2026 Pricing References:" >> prompt.txt
+
+          echo "- Cloud NAT: 0.045 USD per GB" >> prompt.txt
+
+          echo "- Inter-zone Egress: 0.01 USD per GB" >> prompt.txt
+
+          echo "- Log Ingestion: 0.50 USD per GiB" >> prompt.txt
+
+          echo "- Load Balancer Processing: 0.008 USD per GB" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Module: ${{ matrix.module }}" >> prompt.txt
+
+          echo "Direct Monthly Cost: ${TOTAL} USD" >> prompt.txt
+
+          echo "Terraform Resource Types: ${RESOURCE_TYPES}" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Infracost JSON:" >> prompt.txt
+
+          cat infracost.json >> prompt.txt
 
 
-          jq -n \
-            --arg module "${{ matrix.module }}" \
-            --arg total "$TOTAL" \
-            --arg resources "$RESOURCE_TYPES" \
-            --arg infracost "$INFRACOST_JSON" \
-            '{
-              contents: [{
-                parts: [{
-                  text:
-                    "ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)\n\n" +
-                    "TASK: Analyze direct and hidden cost exposure.\n\n" +
-                    "OUTPUT FORMAT: Markdown tables only.\n\n" +
-                    "2026 Pricing References:\n" +
-                    "- Cloud NAT: 0.045 USD per GB\n" +
-                    "- Inter-zone Egress: 0.01 USD per GB\n" +
-                    "- Log Ingestion: 0.50 USD per GiB\n" +
-                    "- Load Balancer Processing: 0.008 USD per GB\n\n" +
-                    "Module: " + $module + "\n" +
-                    "Direct Cost: " + $total + " USD\n" +
-                    "Resources: " + $resources + "\n\n" +
-                    "Infracost JSON:\n" + $infracost
-                }]
-              }]
-            }' > gemini_request.json
+          jq -n --rawfile text prompt.txt \
+            '{contents: [{parts: [{text: $text}]}]}' \
+            > gemini_request.json
       - name: Call Gemini API
         working-directory: '${{ matrix.module }}'
         env:
@@ -137,9 +160,9 @@ jobs:
             end
           ' > gemini.md
       - name: Comment on PR
+        working-directory: '${{ matrix.module }}'
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        working-directory: '${{ matrix.module }}'
         run: >
           echo "## Terraform Cost Analysis (${ { matrix.module } })" >
           comment.md
@@ -148,7 +171,9 @@ jobs:
 
           echo "| Field | Value |" >> comment.md
 
-          echo "| :--- | :--- |" >> comment.md
+          echo "|-------|-------|" >> comment.md
+
+          echo "| Module | ${{ matrix.module }} |" >> comment.md
 
           echo "| Direct Monthly Cost | \$${TOTAL} USD |" >> comment.md
 
@@ -158,7 +183,7 @@ jobs:
 
           echo "" >> comment.md
 
-          echo "## Gemini FinOps Intelligence" >> comment.md
+          echo "## Gemini AI FinOps Review" >> comment.md
 
           echo "" >> comment.md
 
