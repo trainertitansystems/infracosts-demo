@@ -3,34 +3,53 @@ set -euo pipefail
 
 MODULE=$1
 
-cd "$MODULE"
-
-if [ ! -f "infracost.json" ]; then
-  echo "Missing infracost.json in $MODULE"
+if [ -z "${MODULE:-}" ]; then
+  echo "Module argument missing"
   exit 1
 fi
 
-# Extract total
-TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+  echo "GEMINI_API_KEY not set"
+  exit 1
+fi
 
-# Extract compact resource summary
+cd "$MODULE"
+
+if [ ! -f infracost.json ]; then
+  echo "Missing infracost.json in module $MODULE"
+  exit 1
+fi
+
+# Read total cost from root (written by run-terraform.sh)
+if [ ! -f ../.total_cost ]; then
+  echo "Missing total cost file"
+  exit 1
+fi
+
+TOTAL=$(cat ../.total_cost)
+
+# Extract resource types safely
+RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json 2>/dev/null | sort -u | tr '\n' ', ' || echo "Unknown")
+
+# Build compact cost summary
 SUMMARY=$(jq -r '
-  .projects[].breakdown.resources[]? |
+  .projects[].breakdown.resources[] |
   "\(.name) | \(.monthlyCost)"
-' infracost.json | head -n 25)
+' infracost.json | head -n 50)
 
-# Build safe prompt (NO RAW JSON)
+# Build prompt safely
 cat > prompt.txt <<EOF
 ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
 
 Module: ${MODULE}
 Direct Monthly Cost: ${TOTAL} USD
+Resources: ${RESOURCE_TYPES}
 
-Resources:
+Resource Cost Summary:
 ${SUMMARY}
 
 If direct cost is 0, analyze usage-based shadow costs:
-- Cloud NAT processing (0.045 USD/GB)
+- NAT processing (0.045 USD/GB)
 - Inter-zone egress (0.01 USD/GB)
 - Logging ingestion (0.50 USD/GiB)
 - Load balancer processing (0.008 USD/GB)
@@ -38,15 +57,19 @@ If direct cost is 0, analyze usage-based shadow costs:
 Return markdown tables only.
 EOF
 
-# Convert to safe JSON
-jq -Rs '{contents:[{parts:[{text:.}]}]}' prompt.txt > gemini_request.json
+# Convert to valid Gemini JSON payload
+jq -n --rawfile text prompt.txt \
+  '{contents:[{parts:[{text:$text}]}]}' \
+  > gemini_request.json
 
+# Call Gemini API
 RESPONSE=$(curl -sS -X POST \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "Content-Type: application/json" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
   --data-binary @gemini_request.json)
 
+# Parse response safely
 echo "$RESPONSE" | jq -r '
   if .candidates then
     .candidates[0].content.parts[0].text
@@ -55,6 +78,6 @@ echo "$RESPONSE" | jq -r '
   else
     "Unknown Gemini Response"
   end
-' > .gemini_output
+' > ../.gemini_output
 
 echo "Gemini completed for module: $MODULE"
