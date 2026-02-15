@@ -3,87 +3,47 @@ set -euo pipefail
 
 MODULE="$1"
 
-echo "Processing module: $MODULE"
-
 cd "$MODULE"
 
-rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt gemini_request.json
-
-terraform init -input=false
-terraform plan -out=plan.tfplan -input=false
-terraform show -json plan.tfplan > plan.json
-
-infracost breakdown \
-  --path plan.json \
-  --format json \
-  --out-file infracost.json
+if [ ! -f infracost.json ]; then
+  echo "No infracost.json found"
+  echo "Gemini skipped - no cost data" > gemini.md
+  exit 0
+fi
 
 TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
-echo "Total monthly cost: $TOTAL"
-
-# ---------- Build Gemini prompt safely ----------
+# Build minimal, safe prompt
 cat > prompt.txt <<EOF
-You are a Senior GCP FinOps Architect.
+You are a GCP FinOps Architect.
 
-Module: $MODULE
-Direct Monthly Cost: $TOTAL USD
+Direct Monthly Cost: ${TOTAL} USD
 
-Analyze ALL Terraform resources.
-
-If direct cost is 0, do NOT say zero.
-Explain usage-based shadow costs such as:
-- network egress
+If cost is usage-based, explain potential shadow costs such as:
+- Network egress
 - NAT processing
-- logging ingestion
-- load balancer data processing
-- scaling exposure
+- Logging
+- Inter-zone traffic
 
-Provide:
-1) Cost classification (Fixed or Usage-Based)
-2) Shadow cost explanation
-3) Risk rating
-4) Optimization recommendation
-
-Return markdown tables only.
+Provide simple markdown table with:
+Component | Risk | Recommendation
 EOF
 
-# Convert safely to JSON
 jq -n --rawfile text prompt.txt \
-  '{contents:[{parts:[{text:$text}]}]}' \
-  > gemini_request.json
+  '{contents:[{parts:[{text:$text}]}]}' > gemini_request.json
 
-# ---------- Call Gemini safely ----------
+# Call Gemini safely
 RESPONSE=$(curl -sS -X POST \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "Content-Type: application/json" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-  --data-binary @gemini_request.json)
+  --data-binary @gemini_request.json || true)
 
-echo "$RESPONSE" | jq -r '
-  if .candidates then
-    .candidates[0].content.parts[0].text
-  else
-    "Gemini API Error"
-  end
-' > gemini.md
+# Always create gemini.md
+if echo "$RESPONSE" | jq -e '.candidates' >/dev/null 2>&1; then
+  echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text' > gemini.md
+else
+  echo "Gemini API Error" > gemini.md
+fi
 
-cd ..
-
-# ---------- Post PR Comment ----------
-{
-  echo "## 💰 FinOps Audit: $MODULE"
-  echo ""
-  echo "| Field | Value |"
-  echo "|-------|-------|"
-  echo "| Direct Monthly Cost | \$${TOTAL} USD |"
-  echo ""
-  echo "## 🤖 Gemini Architect Review"
-  echo ""
-  cat "$MODULE/gemini.md"
-} > comment.md
-
-gh pr comment "$PR_NUMBER" --body-file comment.md
-
-echo "FinOps review completed."
-
+echo "Gemini completed for module: $MODULE"
