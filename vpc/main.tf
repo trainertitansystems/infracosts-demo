@@ -1,3 +1,4 @@
+#git can be used anywhere
 terraform {
   required_providers {
     google = {
