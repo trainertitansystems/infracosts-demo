@@ -1,14 +1,14 @@
 name: Terraform PR FinOps Gate
-on:
+'on':
   pull_request:
-    branches: [ main ]
-    paths: [ '**/*.tf' ]
-
+    branches:
+      - main
+    paths:
+      - '**/*.tf'
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
 jobs:
   finops:
     runs-on: ubuntu-latest
@@ -16,94 +16,59 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-
+          fetch-depth: 0
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
-
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
-
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Detect Latest Changed Module
+        env:
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: >
+          # 1. Get the name of the file changed in the VERY LATEST commit
 
-      - name: Detect and Process Changed Modules
+          # Using 'git log -1' ensures we only look at the most recent push
+
+          LATEST_FILE=$(git log -1 --name-only --pretty="" | grep '\.tf$' | head
+          -n 1 || true)
+
+
+          # 2. If the latest commit didn't have a .tf file, fallback to the PR
+          diff
+
+          if [ -z "$LATEST_FILE" ]; then
+            echo "Latest commit had no .tf files, checking full PR diff..."
+            LATEST_FILE=$(git diff --name-only origin/main...HEAD | grep '\.tf$' | tail -n 1 || true)
+          fi
+
+
+          if [ -z "$LATEST_FILE" ]; then
+            echo "No Terraform changes found."
+            exit 0
+          fi
+
+
+          # 3. Extract the directory
+
+          MODULE=$(dirname "$LATEST_FILE")
+
+          echo "Detected module: $MODULE"
+
+          echo "MODULE=$MODULE" >> $GITHUB_ENV
+      - name: Run FinOps Audit
+        if: env.MODULE != ''
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           PR_NUMBER: '${{ github.event.pull_request.number }}'
-        # The | below starts the multi-line block. 
-        # EVERY line below it must be indented by at least 10 spaces.
-        run: |
-          if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
-          else
-            CHANGED_FILES=$(git diff --name-only HEAD | grep '\.tf$' || true)
-          fi
-
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No Terraform changes detected."
-            exit 0
-          fi
-
-          DIRS=$(echo "$CHANGED_FILES" | xargs -n1 dirname | sort -u)
-          
-          for MODULE in $DIRS; do
-            echo "Processing Module: $MODULE"
-            
-            pushd "$MODULE" > /dev/null
-            rm -f plan.tfplan plan.json infracost.json gemini_request.json prompt.txt
-
-            terraform init -input=false
-            terraform plan -out=plan.tfplan -input=false
-            terraform show -json plan.tfplan > plan.json
-            infracost breakdown --path plan.json --format json --out-file infracost.json
-
-            TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-            
-            # Build AI Prompt
-            cat > prompt.txt <<EOF
-          You are a Senior GCP FinOps Architect. Analyze cost for module: $MODULE.
-          Direct Monthly Cost: \$$TOTAL USD.
-          
-          1. Suggest Spot/CUD optimizations if cost > 0.
-          2. Identify shadow costs (Networking, Logging, NAT) if cost is 0.
-          Return results in Markdown tables.
-
-          RAW DATA:
-          $(cat infracost.json)
-          EOF
-
-            # Build Gemini JSON safely (using jq --rawfile prevents escaping issues)
-            jq -n --rawfile t prompt.txt '{contents:[{parts:[{text:$t}]}]}' > gemini_request.json
-
-            # Call Gemini API
-            RESPONSE=$(curl -sS -X POST \
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
-              -H "Content-Type: application/json" \
-              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-              --data-binary @gemini_request.json)
-
-            AI_REVIEW=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "⚠️ Gemini analysis unavailable."')
-
-            cat > comment.md <<EOF
-          ## 💰 FinOps Audit: \`$MODULE\`
-          **Estimated Monthly Cost:** \$$TOTAL USD
-
-          $AI_REVIEW
-
-          ---
-          *Analyzed by Gemini 2.0 Flash + Infracost*
-          EOF
-
-            gh pr comment "$PR_NUMBER" --body-file comment.md
-            popd > /dev/null
-          done
+        run: "echo \"\U0001F3D7️  Auditing: $MODULE\"\npushd \"$MODULE\" > /dev/null\n\n# Terraform & Infracost\nterraform init -input=false\nterraform plan -out=plan.tfplan -input=false\nterraform show -json plan.tfplan > plan.json\ninfracost breakdown --path plan.json --format json --out-file infracost.json\n\n# Cost Calculation\nTOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n# Gemini Analysis\ncat > prompt.txt <<EOF\nAnalyze GCP FinOps for module: $MODULE\nCost: \\$$TOTAL\nData: $(cat infracost.json)\nEOF\n\njq -n --rawfile t prompt.txt '{contents:[{parts:[{text:$t}]}]}' > req.json\n\nRESPONSE=$(curl -sS -X POST \\\n  \"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent\" \\\n  -H \"Content-Type: application/json\" \\\n  -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n  --data-binary @req.json)\n\nAI_REVIEW=$(echo \"$RESPONSE\" | jq -r '.candidates[0].content.parts[0].text // \"Error\"')\n\n# PR Comment\ncat > comment.md <<EOF\n## \U0001F4B0 FinOps Audit: \\`$MODULE\\`\n**Monthly Cost:** \\$$TOTAL USD\n$AI_REVIEW\nEOF\n\ngh pr comment \"$PR_NUMBER\" --body-file comment.md\npopd > /dev/null\n"
