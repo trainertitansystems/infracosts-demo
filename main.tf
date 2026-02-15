@@ -1,5 +1,3 @@
-#fkasdflkasdlj
-#ajfljadfadfah
 #falkadjlfjalfjlj
 terraform {
   required_version = ">= 1.4"
