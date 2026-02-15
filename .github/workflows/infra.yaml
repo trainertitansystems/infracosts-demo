@@ -14,14 +14,14 @@ permissions:
 
 jobs:
   finops:
-    name: Latest Commit Cost + Gemini
+    name: Terraform Cost + Gemini Review
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -42,105 +42,117 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Detect latest commit Terraform folder
+      - name: Detect changed Terraform modules
         id: detect
         run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
 
-          if [ -z "$CHANGED" ]; then
+          MODULES=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep '\.tf$' \
+            | xargs -I {} dirname {} \
+            | sort -u || true)
+
+          if [ -z "$MODULES" ]; then
             echo "NO_TF=true" >> $GITHUB_ENV
-            exit 0
+          else
+            echo "MODULE_LIST=$(echo "$MODULES" | tr '\n' ' ')" >> $GITHUB_ENV
           fi
 
-          MODULE=$(echo "$CHANGED" | head -n1 | xargs dirname)
-          echo "MODULE=$MODULE" >> $GITHUB_ENV
-          echo "Detected module: $MODULE"
-
-      - name: Run Terraform + Infracost
-        if: env.NO_TF != 'true'
-        run: |
-          cd "$MODULE"
-
-          terraform init -input=false
-          terraform plan -out=plan.tfplan -input=false
-          terraform show -json plan.tfplan > plan.json
-
-          infracost breakdown \
-            --path plan.json \
-            --format json \
-            --out-file infracost.json
-
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-      - name: Run Gemini AI
+      - name: Run FinOps per module
         if: env.NO_TF != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          cd "$MODULE"
-
-          SUMMARY=$(jq -r '
-            .projects[].breakdown.resources[] |
-            "\(.name) | \(.monthlyCost)"
-          ' infracost.json | head -n 50)
-
-          PROMPT=$(printf "%s\n" \
-            "ROLE: Senior GCP FinOps Architect (2026 Specialist)" \
-            "" \
-            "Module: $MODULE" \
-            "Direct Monthly Cost: $TOTAL USD" \
-            "" \
-            "Resources:" \
-            "$SUMMARY" \
-            "" \
-            "If cost is 0, evaluate shadow costs:" \
-            "- NAT processing (0.045 USD/GB)" \
-            "- Inter-zone egress (0.01 USD/GB)" \
-            "- Logging ingestion (0.50 USD/GiB)" \
-            "- Load balancer processing (0.008 USD/GB)" \
-            "" \
-            "Return markdown tables only."
-          )
-
-          jq -n --arg text "$PROMPT" \
-            '{contents:[{parts:[{text:$text}]}]}' \
-            > gemini_request.json
-
-          RESPONSE=$(curl -sS -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
-            -H "Content-Type: application/json" \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            --data-binary @gemini_request.json)
-
-          echo "$RESPONSE" | jq -r '
-            if .candidates then
-              .candidates[0].content.parts[0].text
-            elif .error then
-              "Gemini API Error: " + .error.message
-            else
-              "Unknown Gemini response"
-            end
-          ' > gemini.md
-
-      - name: Comment on PR
-        if: env.NO_TF != 'true'
-        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          {
-            echo "## 💰 FinOps Audit: $MODULE"
-            echo ""
-            echo "| Field | Value |"
-            echo "| :--- | :--- |"
-            echo "| Direct Monthly Cost | \$${TOTAL} USD |"
-            echo ""
-            echo "---"
-            echo ""
-            echo "## 🤖 Gemini Architect Review"
-            echo ""
-            cat "$MODULE/gemini.md"
-          } > comment.md
+          for MODULE in $MODULE_LIST; do
+            echo "----------------------------------------"
+            echo "Processing module: $MODULE"
+            echo "----------------------------------------"
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+            cd "$MODULE"
+
+            rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt gemini_request.json
+
+            terraform init -input=false
+            terraform plan -out=plan.tfplan -input=false
+            terraform show -json plan.tfplan > plan.json
+
+            infracost breakdown \
+              --path plan.json \
+              --format json \
+              --out-file infracost.json
+
+            TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
+            echo "Total monthly cost: $TOTAL"
+
+            # Build compact resource summary
+            jq -r '
+              .projects[].breakdown.resources[] |
+              "\(.name) | \(.monthlyCost)"
+            ' infracost.json | head -n 50 > summary.txt
+
+            # Build Gemini prompt safely
+            {
+              echo "ROLE: Senior GCP FinOps Architect (2026 Specialist)"
+              echo ""
+              echo "Module: $MODULE"
+              echo "Direct Monthly Cost: $TOTAL USD"
+              echo ""
+              echo "Resources:"
+              cat summary.txt
+              echo ""
+              echo "If direct cost is 0, analyze usage-based shadow costs:"
+              echo "- Cloud NAT processing (0.045 USD/GB)"
+              echo "- Inter-zone egress (0.01 USD/GB)"
+              echo "- Log ingestion (0.50 USD/GiB)"
+              echo "- Load balancer processing (0.008 USD/GB)"
+              echo ""
+              echo "Return markdown tables only."
+            } > prompt.txt
+
+            # Safe JSON creation (CRITICAL FIX)
+            jq -n --rawfile text prompt.txt \
+              '{contents:[{parts:[{text:$text}]}]}' \
+              > gemini_request.json
+
+            RESPONSE=$(curl -sS -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+              -H "Content-Type: application/json" \
+              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              --data-binary @gemini_request.json)
+
+            echo "$RESPONSE" | jq -r '
+              if .candidates then
+                .candidates[0].content.parts[0].text
+              elif .error then
+                "Gemini API Error: " + .error.message
+              else
+                "Unknown Gemini response"
+              end
+            ' > gemini.md
+
+            cd -
+
+            {
+              echo "## 💰 FinOps Audit: $MODULE"
+              echo ""
+              echo "| Field | Value |"
+              echo "| :--- | :--- |"
+              echo "| Direct Monthly Cost | \$${TOTAL} USD |"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## 🤖 Gemini Architect Review"
+              echo ""
+              cat "$MODULE/gemini.md"
+              echo ""
+              echo "_Generated via Gemini 2.0 Flash + Infracost_"
+            } > comment.md
+
+            gh pr comment "$PR_NUMBER" --body-file comment.md
+
+            rm -f comment.md
+          done
