@@ -1,51 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODULE=$1
-cd "$MODULE"
+MODULE_PATH=$1
+ROOT_DIR=$(pwd)
 
-TOTAL=$(cat ../.total_cost)
-RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ', ')
+# Read shared artifacts from Root
+TOTAL=$(cat "$ROOT_DIR/.total_cost")
+INFRACOST_JSON=$(cat "$ROOT_DIR/.infracost_data.json")
 
+# Determine Analysis Strategy
+if (( $(echo "$TOTAL > 0" | bc -l) )); then
+    STRATEGY="Direct Cost Optimization. Focus on: Spot Instances, Committed Use Discounts (CUDs), Graviton/ARM migration, and idle resource termination."
+else
+    STRATEGY="Shadow Cost Analysis (The 'Zero Cost' Trap). The direct cost is $0, which is suspicious. Analyze usage-based costs: NAT Gateway processing, Cross-zone networking (Egress), Log ingestion volume, and Storage API operations."
+fi
+
+# Construct the Prompt
 cat > prompt.txt <<EOF
-ROLE: Senior GCP FinOps Architect (2026 Specialist)
+You are a Super-Intelligent GCP FinOps Architect (2026 Specialist).
+Your goal is to save money and prevent hidden bill shock.
 
-Analyze direct and hidden cost exposure.
+**ANALYSIS CONTEXT:**
+- Module: $MODULE_PATH
+- Estimated Monthly Cost: \$$TOTAL USD
+- Strategy: $STRATEGY
 
-Module: $MODULE
-Direct Monthly Cost: $TOTAL USD
-Resources: $RESOURCE_TYPES
+**INSTRUCTIONS:**
+1. Analyze the Infracost JSON below.
+2. If cost > 0: Recommend specific optimizations (Spot, CUD, Rightsizing).
+3. If cost = 0: You MUST warn about hidden "Shadow Costs" (Data transfer, API ops, Monitoring).
+4. Be brief, professional, and use Markdown tables.
 
-If direct cost is 0, analyze usage-based shadow costs:
-- NAT processing
-- Egress
-- Inter-zone traffic
-- Logging ingestion
-- Load balancer processing
-
-Return markdown tables only.
-
-Infracost JSON:
-$(cat infracost.json)
+**INFRACOST DATA:**
+$INFRACOST_JSON
 EOF
 
-# Proper JSON creation using jq to escape text safely
-cat > ../gemini_request.json <<EOF
-{
-  "contents": [
-    {
-      "parts": [
-        { "text": $(jq -Rs . < prompt.txt) }
-      ]
-    }
-  ]
-}
-EOF
+# safely build JSON payload
+jq -n --arg prompt "$(cat prompt.txt)" \
+'{
+  contents: [{
+    parts: [{
+      text: $prompt
+    }]
+  }]
+}' > "$ROOT_DIR/gemini_request.json"
+
+echo "🤖 Sending request to Gemini..."
 
 RESPONSE=$(curl -sS -X POST \
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}" \
   -H "Content-Type: application/json" \
-  -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-  --data-binary @../gemini_request.json)
+  --data-binary @"$ROOT_DIR/gemini_request.json")
 
-echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Gemini Error"' > ../.gemini_output
+# Extract text safely
+echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Error: Gemini API returned no content."' > "$ROOT_DIR/.gemini_output"
+
+echo "✅ Gemini analysis complete."
