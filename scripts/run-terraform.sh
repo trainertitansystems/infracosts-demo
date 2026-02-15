@@ -2,7 +2,9 @@
 set -euo pipefail
 
 MODULE=$1
-ROOT_DIR=$(pwd) # Capture root directory absolute path
+ROOT_DIR=$(pwd)
+
+echo "Starting Infracost for $MODULE..."
 
 cd "$MODULE"
 rm -f plan.tfplan plan.json infracost.json
@@ -16,7 +18,8 @@ infracost breakdown \
   --format json \
   --out-file infracost.json
 
+# Extract total monthly cost
 TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
-# Fix: Use absolute path to root
+# Save to absolute root path to avoid directory depth issues
 echo "$TOTAL" > "$ROOT_DIR/.total_cost"
