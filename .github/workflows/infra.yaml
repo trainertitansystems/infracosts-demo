@@ -11,41 +11,30 @@ permissions:
   id-token: write
 jobs:
   detect:
-    name: Detect Modified Terraform Modules
     runs-on: ubuntu-latest
     outputs:
-      matrix: '${{ steps.detect.outputs.matrix }}'
+      matrix: '${{ steps.set.outputs.matrix }}'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Detect changed Terraform folders
-        id: detect
-        run: >
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+      - id: set
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
 
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
-
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$'
-          || true)
-
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
 
           if [ -z "$CHANGED" ]; then
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-
           DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-
           JSON=$(printf '%s\n' $DIRS | jq -R . | jq -s -c .)
-
 
           echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
   finops:
-    name: Infracost + Gemini Analysis
     runs-on: ubuntu-latest
     needs: detect
     if: 'needs.detect.outputs.matrix != ''[]'''
@@ -53,11 +42,8 @@ jobs:
       matrix:
         module: '${{ fromJson(needs.detect.outputs.matrix) }}'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq bc
@@ -67,24 +53,21 @@ jobs:
           workload_identity_provider: >-
             projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-      - name: Setup Infracost CLI
-        uses: infracost/actions/setup@v3
+      - uses: hashicorp/setup-terraform@v3
+      - uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Clean previous artifacts
+      - name: Prepare Terraform
         working-directory: '${{ matrix.module }}'
         run: >
-          rm -f infracost.json plan.tfplan plan.json gemini.md prompt.txt ||
+          rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt ||
           true
-      - name: Terraform Init
-        working-directory: '${{ matrix.module }}'
-        run: terraform init -input=false -lock=false
+
+          terraform init -input=false
       - name: Terraform Plan
         working-directory: '${{ matrix.module }}'
-        run: terraform plan -out=plan.tfplan -input=false -lock=false
-      - name: Export plan JSON
+        run: terraform plan -out=plan.tfplan -input=false
+      - name: Export Plan JSON
         working-directory: '${{ matrix.module }}'
         run: terraform show -json plan.tfplan > plan.json
       - name: Run Infracost
@@ -101,27 +84,44 @@ jobs:
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
       - name: Build Gemini Prompt
         working-directory: '${{ matrix.module }}'
-        run: |
-          cat <<EOF > prompt.txt
-          ROLE: Smart GCP FinOps Engineer
+        run: >
+          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u
+          | tr '\n' ', ')
 
-          Analyze this Terraform module for cost exposure.
 
-          Direct Monthly Cost (Infracost): \$${TOTAL} USD
+          printf "ROLE: Senior GCP FinOps Architect\n\n" > prompt.txt
 
-          Even if direct cost is 0 USD, evaluate hidden usage-based costs:
-          - Cloud NAT processing charges
-          - Internet egress exposure
-          - Inter-zone traffic
-          - Logging ingestion
-          - Load balancer data processing
-          - Future 2026 networking pricing exposure
+          printf "Analyze direct and indirect cost exposure.\n\n" >> prompt.txt
 
-          Return structured markdown with tables.
+          printf "OUTPUT REQUIREMENTS:\n" >> prompt.txt
 
-          Infracost JSON:
-          $(cat infracost.json)
-          EOF
+          printf -- "- Provide a Fixed Monthly Floor.\n" >> prompt.txt
+
+          printf -- "- Provide a Production Forecast Range.\n" >> prompt.txt
+
+          printf -- "- Identify Hidden Usage Costs (NAT, Egress, Logs, LB).\n"
+          >> prompt.txt
+
+          printf -- "- Provide Risk Rating (Low/Medium/High).\n\n" >> prompt.txt
+
+          printf "2026 Pricing Reference:\n" >> prompt.txt
+
+          printf -- "- NAT: 0.045 USD per GB\n" >> prompt.txt
+
+          printf -- "- Inter-zone Egress: 0.01 USD per GB\n" >> prompt.txt
+
+          printf -- "- Log Ingestion: 0.50 USD per GiB\n\n" >> prompt.txt
+
+          printf "Module: %s\n" "${{ matrix.module }}" >> prompt.txt
+
+          printf "Direct Cost: %s USD\n" "$TOTAL" >> prompt.txt
+
+          printf "Terraform Resources: %s\n\n" "$RESOURCE_TYPES" >> prompt.txt
+
+          printf "RAW INFRACOST JSON:\n" >> prompt.txt
+
+          cat infracost.json >> prompt.txt
+
 
           jq -n --rawfile text prompt.txt \
             '{contents: [{parts: [{text: $text}]}]}' \
@@ -130,17 +130,42 @@ jobs:
         working-directory: '${{ matrix.module }}'
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-        run: >
+        run: |
           RESPONSE=$(curl -sS -X POST \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
             -H "x-goog-api-key: ${GEMINI_API_KEY}" \
             -d @gemini_request.json)
 
-          echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "No
-          AI response"' > gemini.md
+          echo "$RESPONSE" | jq -r '
+            if .candidates then
+              .candidates[0].content.parts[0].text
+            elif .error then
+              "Gemini API Error: " + .error.message
+            else
+              "Gemini returned unexpected response"
+            end
+          ' > gemini.md
       - name: Comment on PR
         working-directory: '${{ matrix.module }}'
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: "{\n  echo \"## \U0001F4B0 Terraform Cost Analysis\"\n  echo \"\"\n  echo \"| Field | Value |\"\n  echo \"|-------|-------|\"\n  echo \"| Module | ${{ matrix.module }} |\"\n  echo \"| Direct Monthly Cost | \\$${TOTAL} USD |\"\n  echo \"\"\n  echo \"---\"\n  echo \"\"\n  echo \"## \U0001F916 Gemini AI FinOps Review\"\n  echo \"\"\n  cat gemini.md\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
+        run: >
+          printf "## Terraform Cost Analysis (%s)\n" "${{ matrix.module }}" >
+          comment.md
+
+          printf "| Field | Value |\n" >> comment.md
+
+          printf "| :--- | :--- |\n" >> comment.md
+
+          printf "| Direct Monthly Cost | \$%s USD |\n\n" "$TOTAL" >> comment.md
+
+          printf "---\n\n" >> comment.md
+
+          printf "## Gemini FinOps Intelligence\n\n" >> comment.md
+
+          cat gemini.md >> comment.md
+
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file
+          comment.md
