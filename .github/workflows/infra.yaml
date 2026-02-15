@@ -16,13 +16,13 @@ jobs:
     outputs:
       matrix: '${{ steps.set.outputs.matrix }}'
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Fetch base branch
         run: git fetch origin main
-      - name: Detect changed Terraform directories
+      - name: Detect changed Terraform folders
         id: set
         run: >
           set -e
@@ -45,25 +45,24 @@ jobs:
           JSON=$(printf '%s\n' $DIRS | jq -R . | jq -s -c .)
 
 
-          echo "Detected modules: $JSON"
-
-
           echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
   finops:
     name: Infracost + Gemini Analysis
+    runs-on: ubuntu-latest
     needs: detect
     if: 'needs.detect.outputs.matrix != ''[]'''
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         module: '${{ fromJson(needs.detect.outputs.matrix) }}'
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -73,24 +72,22 @@ jobs:
           create_credentials_file: true
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-      - name: Setup Infracost
+      - name: Setup Infracost CLI
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Clean previous files
+      - name: Clean previous artifacts
         working-directory: '${{ matrix.module }}'
-        run: |
-          rm -f infracost.json
-          rm -f plan.tfplan
-          rm -f plan.json
-          rm -f gemini.md
+        run: >
+          rm -f infracost.json plan.tfplan plan.json gemini.md prompt.txt ||
+          true
       - name: Terraform Init
         working-directory: '${{ matrix.module }}'
         run: terraform init -input=false -lock=false
       - name: Terraform Plan
         working-directory: '${{ matrix.module }}'
         run: terraform plan -out=plan.tfplan -input=false -lock=false
-      - name: Export plan JSON
+      - name: Export plan to JSON
         working-directory: '${{ matrix.module }}'
         run: terraform show -json plan.tfplan > plan.json
       - name: Run Infracost
@@ -105,41 +102,65 @@ jobs:
           // 0' infracost.json)
 
 
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-          echo "Monthly Cost: $TOTAL USD"
+          echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
       - name: Build Gemini Prompt
         working-directory: '${{ matrix.module }}'
-        run: |
-          echo "You are a Principal GCP FinOps Architect." > prompt.txt
-          echo "" >> prompt.txt
-          echo "Direct Monthly Cost from Infracost: ${TOTAL} USD." >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Perform deep shadow cost analysis including:" >> prompt.txt
-          echo "- NAT Gateway usage risks" >> prompt.txt
-          echo "- Egress and ingress billing exposure" >> prompt.txt
-          echo "- Public IP costs" >> prompt.txt
-          echo "- Load balancer scaling risks" >> prompt.txt
-          echo "- Autoscaling compute bursts" >> prompt.txt
-          echo "- Persistent disk IOPS growth" >> prompt.txt
-          echo "- Snapshot accumulation" >> prompt.txt
-          echo "- Logging and monitoring usage" >> prompt.txt
-          echo "- Hidden usage-based billing" >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Provide:" >> prompt.txt
-          echo "1. Direct cost summary" >> prompt.txt
-          echo "2. Dependent cost risks" >> prompt.txt
-          echo "3. Optimization recommendations" >> prompt.txt
-          echo "4. Production risk rating (Low/Medium/High)" >> prompt.txt
-          echo "" >> prompt.txt
-          echo "INFRACOST JSON:" >> prompt.txt
+        run: >
+          printf "%s\n" \
+
+          "You are a Principal GCP FinOps Architect performing a cost risk
+          review." \
+
+          "" \
+
+          "Terraform Module: ${{ matrix.module }}" \
+
+          "Direct Monthly Cost from Infracost: ${TOTAL} USD" \
+
+          "" \
+
+          "Important:" \
+
+          "Even if direct cost is 0 USD, evaluate indirect and usage-based
+          billing risks." \
+
+          "" \
+
+          "If networking resources exist (VPC, NAT, routers, firewall, load
+          balancers, VPN):" \
+
+          "- Identify dependent billing surfaces" \
+
+          "- Estimate internet egress cost exposure" \
+
+          "- Estimate NAT processing charges" \
+
+          "- Estimate inter-zone traffic charges" \
+
+          "- Highlight logging/monitoring ingestion costs" \
+
+          "- Provide realistic 2026 pricing assumptions" \
+
+          "- Provide Low / Medium / High risk rating" \
+
+          "" \
+
+          "Do NOT say 'no cost' unless absolutely nothing billable exists." \
+
+          "" \
+
+          "Infracost JSON:" \
+
+          > prompt.txt
+
+
           cat infracost.json >> prompt.txt
 
-          jq -n \
-            --rawfile text prompt.txt \
-            '{ contents: [{ role: "user", parts: [{ text: $text }] }] }' \
+
+          jq -n --rawfile text prompt.txt \
+            '{ contents: [{ parts: [{ text: $text }] }] }' \
             > gemini_request.json
-      - name: Call Gemini
+      - name: Call Gemini API
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         working-directory: '${{ matrix.module }}'
@@ -148,10 +169,10 @@ jobs:
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @gemini_request.json \
-            | jq -r '.candidates[0].content.parts[0].text // .error.message // "No AI response"' \
+            | jq -r '.candidates[0].content.parts[0].text // "No AI response"' \
             > gemini.md
       - name: Comment on PR
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         working-directory: '${{ matrix.module }}'
-        run: "{\n  echo \"## \U0001F4B0 Terraform Cost Analysis\"\n  echo \"\"\n  echo \"**Module:** \\`${{ matrix.module }}\\`\"\n  echo \"**Estimated Monthly Cost:** \\$${TOTAL} USD\"\n  echo \"\"\n  echo \"---\"\n  echo \"\"\n  echo \"## \U0001F916 Gemini AI FinOps Review\"\n  echo \"\"\n  cat gemini.md\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
+        run: "{\n  echo \"## \U0001F4B0 Terraform Cost Analysis\"\n  echo \"\"\n  echo \"**Module:** ${{ matrix.module }}\"\n  echo \"**Estimated Monthly Cost:** ${TOTAL} USD\"\n  echo \"\"\n  echo \"---\"\n  echo \"\"\n  echo \"## \U0001F916 Gemini AI FinOps Review\"\n  echo \"\"\n  cat gemini.md\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
