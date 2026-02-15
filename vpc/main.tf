@@ -1,4 +1,3 @@
-#dfhklahfkljahkfhahkafdh
 terraform {
   required_providers {
     google = {
