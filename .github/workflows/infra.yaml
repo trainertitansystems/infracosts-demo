@@ -1,10 +1,8 @@
 name: Terraform PR FinOps Gate
 on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - '**/*.tf'
+    branches: [ main ]
+    paths: [ '**/*.tf' ]
 
 permissions:
   contents: read
@@ -18,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2 # Necessary to compare HEAD and HEAD~1
+          fetch-depth: 2
 
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
@@ -37,81 +35,75 @@ jobs:
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
 
-      - name: Detect changed module
-        id: detect
+      - name: Detect and Process Changed Modules
+        env:
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+        # The | below starts the multi-line block. 
+        # EVERY line below it must be indented by at least 10 spaces.
         run: |
-          # Compare last commit with its parent
           if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
           else
-            CHANGED=$(git diff --name-only HEAD | grep '\.tf$' || true)
+            CHANGED_FILES=$(git diff --name-only HEAD | grep '\.tf$' || true)
           fi
 
-          if [ -z "$CHANGED" ]; then
+          if [ -z "$CHANGED_FILES" ]; then
             echo "No Terraform changes detected."
             exit 0
           fi
 
-          # Get the unique directory name
-          MODULE=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
+          DIRS=$(echo "$CHANGED_FILES" | xargs -n1 dirname | sort -u)
           
-          # Check if multiple directories were changed
-          if [ $(echo "$MODULE" | wc -l) -gt 1 ]; then
-            echo "Error: Multiple modules modified in one commit. This workflow supports one at a time."
-            echo "$MODULE"
-            exit 1
-          fi
+          for MODULE in $DIRS; do
+            echo "Processing Module: $MODULE"
+            
+            pushd "$MODULE" > /dev/null
+            rm -f plan.tfplan plan.json infracost.json gemini_request.json prompt.txt
 
-          echo "Detected module: $MODULE"
-          echo "MODULE=$MODULE" >> $GITHUB_ENV
+            terraform init -input=false
+            terraform plan -out=plan.tfplan -input=false
+            terraform show -json plan.tfplan > plan.json
+            infracost breakdown --path plan.json --format json --out-file infracost.json
 
-      - name: Run Terraform & Infracost
-        if: env.MODULE != ''
-        working-directory: ${{ env.MODULE }} # This handles the 'cd' automatically
-        run: |
-          terraform init -input=false
-          terraform plan -out=plan.tfplan -input=false
-          terraform show -json plan.tfplan > plan.json
-
-          infracost breakdown \
-            --path plan.json \
-            --format json \
-            --out-file infracost.json
-
-          # Extract total and pass to ENV
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-      - name: Build Report
-        if: env.MODULE != ''
-        working-directory: ${{ env.MODULE }}
-        run: |
-          # Collect resource types for the report
-          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ',' || echo "None")
+            TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+            
+            # Build AI Prompt
+            cat > prompt.txt <<EOF
+          You are a Senior GCP FinOps Architect. Analyze cost for module: $MODULE.
+          Direct Monthly Cost: \$$TOTAL USD.
           
-          echo "## 💰 FinOps Audit: \`${{ env.MODULE }}\`" > ../comment.md
-          echo "" >> ../comment.md
-          echo "| Field | Value |" >> ../comment.md
-          echo "|-------|-------|" >> ../comment.md
-          echo "| Direct Monthly Cost | \$${{ env.TOTAL }} USD |" >> ../comment.md
-          echo "" >> ../comment.md
-          echo "## 🤖 Cost Recommendation" >> ../comment.md
-          echo "" >> ../comment.md
+          1. Suggest Spot/CUD optimizations if cost > 0.
+          2. Identify shadow costs (Networking, Logging, NAT) if cost is 0.
+          Return results in Markdown tables.
 
-          if [ "${{ env.TOTAL }}" = "0" ] || [ "${{ env.TOTAL }}" = "0.0" ]; then
-            echo "- **No fixed cost detected.**" >> ../comment.md
-            echo "- Review usage-based charges: Network Egress, NAT processing, and Logging ingestion." >> ../comment.md
-          else
-            echo "- **Fixed cost detected.**" >> ../comment.md
-            echo "- Optimization: Review instance sizing and consider Spot Instances for non-prod." >> ../comment.md
-          fi
-          
-          echo "" >> ../comment.md
-          echo "_Generated via Infracost Analysis_" >> ../comment.md
+          RAW DATA:
+          $(cat infracost.json)
+          EOF
 
-      - name: Post PR Comment
-        if: env.MODULE != ''
-        env:
-          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+            # Build Gemini JSON safely (using jq --rawfile prevents escaping issues)
+            jq -n --rawfile t prompt.txt '{contents:[{parts:[{text:$t}]}]}' > gemini_request.json
+
+            # Call Gemini API
+            RESPONSE=$(curl -sS -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+              -H "Content-Type: application/json" \
+              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              --data-binary @gemini_request.json)
+
+            AI_REVIEW=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "⚠️ Gemini analysis unavailable."')
+
+            cat > comment.md <<EOF
+          ## 💰 FinOps Audit: \`$MODULE\`
+          **Estimated Monthly Cost:** \$$TOTAL USD
+
+          $AI_REVIEW
+
+          ---
+          *Analyzed by Gemini 2.0 Flash + Infracost*
+          EOF
+
+            gh pr comment "$PR_NUMBER" --body-file comment.md
+            popd > /dev/null
+          done
