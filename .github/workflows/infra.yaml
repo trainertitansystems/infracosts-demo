@@ -1,10 +1,8 @@
 name: Terraform PR FinOps Gate
 on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - '**/*.tf'
+    branches: [ main ]
+    paths: [ '**/*.tf' ]
 
 permissions:
   contents: read
@@ -22,9 +20,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -45,18 +41,12 @@ jobs:
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
-          
-          # Find unique directories with changed .tf files
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {} dirname {} | sort -u || true)
-
           if [ -z "$CHANGED" ]; then
             echo "NO_CHANGES=true" >> $GITHUB_ENV
-            echo "No Terraform modules changed."
           else
-            # Convert newlines to spaces for the for-loop
-            MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')
-            echo "MODULE_LIST=$MODULE_LIST" >> $GITHUB_ENV
-            echo "Detected modules: $MODULE_LIST"
+            # Fix: Space-separated list for shell looping
+            echo "MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')" >> $GITHUB_ENV
           fi
 
       - name: Run FinOps scripts per module
@@ -66,19 +56,13 @@ jobs:
           PR_NUMBER: '${{ github.event.pull_request.number }}'
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
-          # Make scripts executable
           chmod +x scripts/*.sh
-
+          # Fix: Use $MODULE_LIST directly to avoid context warnings
           for module in $MODULE_LIST; do
-            echo "-------------------------------------"
-            echo "Processing module: $module"
-            echo "-------------------------------------"
-
-            # Run scripts using the module path
             ./scripts/run-terraform.sh "$module"
             ./scripts/run-gemini.sh "$module"
             ./scripts/post-comment.sh "$module" "$PR_NUMBER"
-
-            # Cleanup temp files to prevent cross-contamination
-            rm -f .total_cost .gemini_output .infracost_data.json
+            
+            # Consistent cleanup
+            rm -f .total_cost .gemini_output gemini_request.json
           done
