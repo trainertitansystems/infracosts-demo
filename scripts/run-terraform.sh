@@ -4,7 +4,7 @@ set -euo pipefail
 MODULE=$1
 cd "$MODULE"
 
-rm -f plan.tfplan plan.json infracost.json
+rm -f plan.tfplan plan.json infracost.json .total_cost
 
 terraform init -input=false
 terraform plan -out=plan.tfplan -input=false
@@ -17,5 +17,7 @@ infracost breakdown \
 
 TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
-echo "$TOTAL" > ../.total_cost
+echo "Total monthly cost: $TOTAL"
 
+# ✅ Write inside module
+echo "$TOTAL" > .total_cost
