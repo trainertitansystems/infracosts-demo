@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-MODULE=$1
-PR=$2
+MODULE="$1"
+PR_NUMBER="$2"
 
-TOTAL=$(cat .total_cost)
-AI=$(cat .gemini_output)
+TOTAL_FILE="${MODULE}/.total_cost"
+GEMINI_FILE="${MODULE}/.gemini_output"
 
-cat > comment.md <<EOF
-## Terraform Cost Analysis ($MODULE)
+if [ ! -f "$TOTAL_FILE" ]; then
+  echo "Missing total cost file: $TOTAL_FILE"
+  exit 1
+fi
 
-| Field | Value |
-|-------|-------|
-| Direct Monthly Cost | \$$TOTAL USD |
+if [ ! -f "$GEMINI_FILE" ]; then
+  echo "Missing Gemini output file: $GEMINI_FILE"
+  exit 1
+fi
 
----
+TOTAL=$(cat "$TOTAL_FILE")
 
-## Gemini AI FinOps Review
+{
+  echo "## 💰 Terraform Cost Analysis (${MODULE})"
+  echo ""
+  echo "| Field | Value |"
+  echo "| :--- | :--- |"
+  echo "| Direct Monthly Cost | \$${TOTAL} USD |"
+  echo ""
+  echo "---"
+  echo ""
+  echo "## 🤖 Gemini AI FinOps Intelligence"
+  echo ""
+  cat "$GEMINI_FILE"
+} > comment.md
 
-$AI
-EOF
-
-gh pr comment "$PR" --body-file comment.md
-
+gh pr comment "$PR_NUMBER" --body-file comment.md
