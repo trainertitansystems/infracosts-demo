@@ -1,14 +1,16 @@
 name: Terraform PR FinOps Gate
-'on':
+on:
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
+
 permissions:
   contents: read
   pull-requests: write
   id-token: write
+
 jobs:
   finops:
     name: Terraform Cost + Gemini Review
@@ -18,42 +20,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq bc
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: >-
-            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
+          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+
       - name: Setup Infracost CLI
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
+
       - name: Detect changed Terraform modules
         id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
-
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
+          
+          # Find unique directories with changed .tf files
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {} dirname {} | sort -u || true)
 
           if [ -z "$CHANGED" ]; then
             echo "NO_CHANGES=true" >> $GITHUB_ENV
-            exit 0
+            echo "No Terraform modules changed."
+          else
+            # Convert newlines to spaces for the for-loop
+            MODULE_LIST=$(echo "$CHANGED" | tr '\n' ' ')
+            echo "MODULE_LIST=$MODULE_LIST" >> $GITHUB_ENV
+            echo "Detected modules: $MODULE_LIST"
           fi
 
-          MODULES=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-          echo "Detected modules:"
-          echo "$MODULES"
-
-          echo "MODULES<<EOF" >> $GITHUB_ENV
-          echo "$MODULES" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
       - name: Run FinOps scripts per module
         if: env.NO_CHANGES != 'true'
         env:
@@ -61,20 +66,19 @@ jobs:
           PR_NUMBER: '${{ github.event.pull_request.number }}'
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
-          for module in $MODULES; do
+          # Make scripts executable
+          chmod +x scripts/*.sh
+
+          for module in $MODULE_LIST; do
             echo "-------------------------------------"
             echo "Processing module: $module"
             echo "-------------------------------------"
 
-            # Root module fix
-            if [ "$module" = "." ]; then
-              MODULE_PATH="."
-            else
-              MODULE_PATH="$module"
-            fi
+            # Run scripts using the module path
+            ./scripts/run-terraform.sh "$module"
+            ./scripts/run-gemini.sh "$module"
+            ./scripts/post-comment.sh "$module" "$PR_NUMBER"
 
-            bash scripts/run-terraform.sh "$MODULE_PATH"
-            bash scripts/run-gemini.sh "$MODULE_PATH"
-            bash scripts/post-comment.sh "$MODULE_PATH" "$PR_NUMBER"
-
+            # Cleanup temp files to prevent cross-contamination
+            rm -f .total_cost .gemini_output .infracost_data.json
           done
