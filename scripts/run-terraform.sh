@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODULE=$1
-ROOT_DIR=$(pwd) # Track repository root
+ROOT_DIR=$(pwd)
 
 cd "$MODULE"
 rm -f plan.tfplan plan.json infracost.json
@@ -16,9 +16,9 @@ infracost breakdown \
   --format json \
   --out-file infracost.json
 
-# Extract total and save to a hidden file in the root
+# Extract total cost and save to root
 TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 echo "$TOTAL" > "$ROOT_DIR/.total_cost"
 
-# Also copy the infracost JSON to the root so Gemini can find it easily
+# Copy raw JSON to root for the Gemini script
 cp infracost.json "$ROOT_DIR/.infracost.json"
