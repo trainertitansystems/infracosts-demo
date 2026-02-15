@@ -1,36 +1,29 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-MODULE=$1
-cd "$MODULE"
-
-TOTAL=$(cat ../.total_cost)
-RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ', ')
+# Build compact summary
+SUMMARY=$(jq -r '
+  .projects[].breakdown.resources[] |
+  "\(.name) | \(.monthlyCost)"
+' infracost.json | head -n 50)
 
 cat > prompt.txt <<EOF
-ROLE: Senior GCP FinOps Architect (2026 Specialist)
+ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
 
-Analyze direct and hidden cost exposure.
+Module: ${MODULE}
+Direct Monthly Cost: ${TOTAL} USD
 
-Module: $MODULE
-Direct Monthly Cost: $TOTAL USD
-Resources: $RESOURCE_TYPES
+Resources Summary:
+${SUMMARY}
 
 If direct cost is 0, analyze usage-based shadow costs:
-- NAT processing
-- Egress
-- Inter-zone traffic
-- Logging ingestion
-- Load balancer processing
+- NAT processing (0.045 USD/GB)
+- Inter-zone egress (0.01 USD/GB)
+- Logging ingestion (0.50 USD/GiB)
+- Load balancer processing (0.008 USD/GB)
 
 Return markdown tables only.
-
-Infracost JSON:
-$(cat infracost.json)
 EOF
 
 jq -n --rawfile text prompt.txt \
-  '{contents: [{parts: [{text: $text}]}]}' \
+  '{contents:[{parts:[{text:$text}]}]}' \
   > gemini_request.json
 
 RESPONSE=$(curl -sS -X POST \
@@ -39,5 +32,12 @@ RESPONSE=$(curl -sS -X POST \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
   --data-binary @gemini_request.json)
 
-echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Gemini Error"' > ../.gemini_output
-
+echo "$RESPONSE" | jq -r '
+  if .candidates then
+    .candidates[0].content.parts[0].text
+  elif .error then
+    "Gemini API Error: " + .error.message
+  else
+    "Unknown Gemini Response"
+  end
+' > ../.gemini_output
