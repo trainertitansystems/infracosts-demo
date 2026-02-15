@@ -4,16 +4,16 @@ set -euo pipefail
 MODULE=$1
 PR=$2
 
-# Load results from root
+# Load artifacts from the root
 TOTAL=$(cat .total_cost)
 AI=$(cat .gemini_output)
 
 cat > comment.md <<EOF
 ## 💰 Terraform Cost Analysis (\`$MODULE\`)
 
-| Metric | Estimated Value |
-|:-------|:----------------|
-| **Direct Monthly Cost** | **\$$TOTAL USD** |
+| Metric | Estimated Monthly Impact |
+|:-------|:-------------------------|
+| **Direct Monthly Cost** | \$$TOTAL USD |
 
 ---
 
@@ -22,8 +22,7 @@ cat > comment.md <<EOF
 $AI
 
 ---
-*Note: Analyzed by Gemini 2.0 Flash Agent*
+*Note: Analyzed by Gemini 2.0 Flash FinOps Agent.*
 EOF
 
-# Post the comment using the GitHub CLI
 gh pr comment "$PR" --body-file comment.md
