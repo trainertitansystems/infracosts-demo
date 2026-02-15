@@ -1,7 +1,6 @@
-#dnfkjadfjkadfjadfkkadfhjkhadfhaj
-#adhfkahfkahk
 #dfkjdahfhdkfbadfkadjkfghkfadhfkadhsfkafjfgj,fh
 #get the cost analysis adlfjadfahjdfkhakfhakdhf
+#dfnkdsajf
 terraform {
   required_version = ">= 1.4"
 
