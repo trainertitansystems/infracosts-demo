@@ -11,13 +11,12 @@ permissions:
   id-token: write
 jobs:
   finops:
-    name: Terraform Cost + Gemini Review
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
       - name: Authenticate to GCP
@@ -28,50 +27,41 @@ jobs:
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-      - name: Setup Infracost CLI
+      - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Detect changed module
-        id: detect
-        run: >
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
-
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.tf$'
-          || true)
-
+      - name: Detect changed module (last commit only)
+        run: |
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+          else
+            CHANGED=$(git diff --name-only HEAD | grep '\.tf$' || true)
+          fi
 
           if [ -z "$CHANGED" ]; then
-            echo "No Terraform changes detected"
+            echo "No Terraform changes in last commit"
             exit 0
           fi
 
-
           DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-
           COUNT=$(echo "$DIRS" | wc -l | tr -d ' ')
 
-
           if [ "$COUNT" -gt 1 ]; then
-            echo "Multiple Terraform modules changed:"
+            echo "Multiple modules modified in last commit:"
             echo "$DIRS"
             exit 1
           fi
 
-
           MODULE="$DIRS"
-
+          echo "Detected module: $MODULE"
           echo "MODULE=$MODULE" >> $GITHUB_ENV
-      - name: Terraform Plan + Infracost
+      - name: Run Terraform & Infracost
         run: >
           cd "$MODULE"
 
 
-          rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt
-          gemini_request.json
+          rm -f plan.tfplan plan.json infracost.json
 
 
           terraform init -input=false
@@ -89,72 +79,12 @@ jobs:
           TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
           // 0' infracost.json)
 
-
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-      - name: Build Gemini Prompt
-        run: >
-          cd "$MODULE"
-
-
-          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u
-          | tr '\n' ', ')
-
-
-          echo "You are a GCP FinOps Architect." > prompt.txt
-
-          echo "" >> prompt.txt
-
-          echo "Module: $MODULE" >> prompt.txt
-
-          echo "Direct Monthly Cost: $TOTAL USD" >> prompt.txt
-
-          echo "" >> prompt.txt
-
-          echo "Resources Detected: $RESOURCE_TYPES" >> prompt.txt
-
-          echo "" >> prompt.txt
-
-          echo "Instructions:" >> prompt.txt
-
-          echo "- If fixed cost resources exist, suggest cheaper machine types
-          (e2-micro, e2-small, Spot VMs, preemptible, smaller disks)." >>
-          prompt.txt
-
-          echo "- If usage-based resources exist (VPC, PubSub, Load Balancer,
-          Cloud NAT, Storage), explain shadow costs dynamically." >> prompt.txt
-
-          echo "- Never just say zero. Explain cost exposure." >> prompt.txt
-
-          echo "- Keep output concise and technical." >> prompt.txt
-
-          echo "" >> prompt.txt
-
-          echo "Infracost JSON:" >> prompt.txt
-
-          cat infracost.json >> prompt.txt
-
-
-          jq -n --rawfile text prompt.txt \
-            '{contents:[{parts:[{text:$text}]}]}' \
-            > gemini_request.json
-      - name: Call Gemini API
-        run: |
-          cd "$MODULE"
-
-          RESPONSE=$(curl -sS -X POST \
-            https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \
-            -H "Content-Type: application/json" \
-            -H "x-goog-api-key: ${{ secrets.GEMINI_API_KEY }}" \
-            --data-binary @gemini_request.json)
-
-          echo "$RESPONSE" | jq -r '
-            if .candidates then
-              .candidates[0].content.parts[0].text
-            else
-              "Gemini API Error"
-            end
-          ' > gemini.md
-      - name: Comment on PR
+      - name: Build AI-style Recommendation
+        run: "cd \"$MODULE\"\n\nRESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\\n' ',')\n\necho \"## \U0001F4B0 FinOps Audit: $MODULE\" > ../comment.md\necho \"\" >> ../comment.md\necho \"| Field | Value |\" >> ../comment.md\necho \"|-------|-------|\" >> ../comment.md\necho \"| Direct Monthly Cost | \\$${TOTAL} USD |\" >> ../comment.md\necho \"\" >> ../comment.md\necho \"## \U0001F916 Cost Recommendation\" >> ../comment.md\necho \"\" >> ../comment.md\n\nif [ \"$TOTAL\" = \"0\" ] || [ \"$TOTAL\" = \"0.0\" ]; then\n  echo \"- No fixed cost detected.\" >> ../comment.md\n  echo \"- Review usage-based charges such as network egress, logging ingestion, NAT processing, load balancer traffic, and API calls.\" >> ../comment.md\nelse\n  echo \"- Fixed cost detected from provisioned resources.\" >> ../comment.md\n  echo \"- Consider smaller machine types, spot/preemptible instances, autoscaling, and storage optimization.\" >> ../comment.md\nfi\n\necho \"\" >> ../comment.md\necho \"_Generated via Infracost_\" >> ../comment.md\n"
+      - name: Post PR Comment
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: "cd \"$MODULE\"\n\necho \"## \U0001F4B0 FinOps Audit: $MODULE\" > comment.md\necho \"\" >> comment.md\necho \"| Field | Value |\" >> comment.md\necho \"|-------|-------|\" >> comment.md\necho \"| Direct Monthly Cost | \\$$TOTAL USD |\" >> comment.md\necho \"\" >> comment.md\necho \"## \U0001F916 AI Recommendation\" >> comment.md\necho \"\" >> comment.md\ncat gemini.md >> comment.md\necho \"\" >> comment.md\necho \"_Generated via Infracost + Gemini 2.0 Flash_\" >> comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
+        run: >
+          gh pr comment ${{ github.event.pull_request.number }} --body-file
+          comment.md
