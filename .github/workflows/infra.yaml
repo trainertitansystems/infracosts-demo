@@ -16,7 +16,8 @@ jobs:
     outputs:
       matrix: '${{ steps.detect.outputs.matrix }}'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Detect changed Terraform folders
@@ -55,7 +56,8 @@ jobs:
       matrix:
         module: '${{ fromJson(needs.detect.outputs.matrix) }}'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Install dependencies
@@ -69,20 +71,24 @@ jobs:
             projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
           create_credentials_file: true
-      - uses: hashicorp/setup-terraform@v3
-      - uses: infracost/actions/setup@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Setup Infracost CLI
+        uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Clean artifacts
+      - name: Clean previous artifacts
         working-directory: '${{ matrix.module }}'
-        run: rm -f infracost.json plan.tfplan plan.json || true
+        run: >
+          rm -f infracost.json plan.tfplan plan.json gemini.md prompt.txt ||
+          true
       - name: Terraform Init
         working-directory: '${{ matrix.module }}'
         run: terraform init -input=false -lock=false
       - name: Terraform Plan
         working-directory: '${{ matrix.module }}'
         run: terraform plan -out=plan.tfplan -input=false -lock=false
-      - name: Export plan
+      - name: Export plan to JSON
         working-directory: '${{ matrix.module }}'
         run: terraform show -json plan.tfplan > plan.json
       - name: Run Infracost
@@ -99,28 +105,52 @@ jobs:
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
       - name: Build Gemini Prompt
         working-directory: '${{ matrix.module }}'
-        run: |
-          printf "%s\n" \
-          "You are a Smart GCP FinOps Engineer." \
-          "" \
-          "Terraform Module: ${{ matrix.module }}" \
-          "Direct Monthly Cost: ${TOTAL} USD" \
-          "" \
-          "Important:" \
-          "Even if direct cost is 0 USD evaluate hidden costs including:" \
-          "- Cloud NAT processing charges" \
-          "- Internet egress exposure" \
-          "- Inter-zone traffic" \
-          "- Logging ingestion" \
-          "- Load balancer data processing" \
-          "- Future scale exposure (2026 pricing)" \
-          "" \
-          "Return output in markdown table format." \
-          "" \
-          "Infracost JSON:" \
-          > prompt.txt
+        run: >
+          echo "You are a Smart GCP FinOps Engineer auditing hidden cloud
+          liabilities." > prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Terraform Module: ${{ matrix.module }}" >> prompt.txt
+
+          echo "Direct Monthly Cost (Infracost): ${TOTAL} USD" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "If direct cost is 0 USD, do NOT conclude no cost." >> prompt.txt
+
+          echo "Evaluate indirect costs including:" >> prompt.txt
+
+          echo "- Cloud NAT processing (assume 2TB @ \$0.045/GB)" >> prompt.txt
+
+          echo "- Internet egress exposure" >> prompt.txt
+
+          echo "- Inter-zone traffic (assume 2TB @ \$0.01/GB)" >> prompt.txt
+
+          echo "- Logging ingestion (assume \$0.50/GiB)" >> prompt.txt
+
+          echo "- Load balancer data processing" >> prompt.txt
+
+          echo "- 2026 pricing risk exposure" >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Return output in markdown table format." >> prompt.txt
+
+          echo "" >> prompt.txt
+
+          echo "Resources detected:" >> prompt.txt
+
+
+          jq -r '.resource_changes[].type' plan.json | sort -u >> prompt.txt
+
+
+          echo "" >> prompt.txt
+
+          echo "Infracost JSON:" >> prompt.txt
 
           cat infracost.json >> prompt.txt
+
 
           jq -n --rawfile text prompt.txt \
             '{ contents: [{ parts: [{ text: $text }] }] }' \
