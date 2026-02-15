@@ -1,5 +1,3 @@
-#asdflajsdfasdj,fhdjkl
-#afjladjfafadfh
 #fdajkfhkasfkakfakdfhkahfjk
 terraform {
   required_providers {
