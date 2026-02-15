@@ -1,74 +1,138 @@
 name: Terraform PR FinOps Gate
-'on':
+on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - '**/*.tf'
+    branches: [ main ]
+    paths: [ '**/*.tf' ]
+
 permissions:
   contents: read
   pull-requests: write
   id-token: write
+
 jobs:
   finops:
+    name: FinOps Audit (Latest Commit)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # We need history to resolve the commit SHA
+
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: >-
-            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
+          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Detect Latest Changed Module
-        env:
-          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: >
-          # 1. Get the name of the file changed in the VERY LATEST commit
 
-          # Using 'git log -1' ensures we only look at the most recent push
+      - name: 🎯 Detect Module from LATEST COMMIT
+        id: detect
+        run: |
+          # THE FIX: 
+          # We use the explicit SHA of the PR head (the latest push).
+          # 'git diff-tree' lists ONLY files changed in that specific commit.
+          LATEST_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          echo "Analyzing Commit SHA: $LATEST_SHA"
+          
+          # Get list of files changed ONLY in this commit
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "$LATEST_SHA" | grep '\.tf$' || true)
 
-          LATEST_FILE=$(git log -1 --name-only --pretty="" | grep '\.tf$' | head
-          -n 1 || true)
-
-
-          # 2. If the latest commit didn't have a .tf file, fallback to the PR
-          diff
-
-          if [ -z "$LATEST_FILE" ]; then
-            echo "Latest commit had no .tf files, checking full PR diff..."
-            LATEST_FILE=$(git diff --name-only origin/main...HEAD | grep '\.tf$' | tail -n 1 || true)
-          fi
-
-
-          if [ -z "$LATEST_FILE" ]; then
-            echo "No Terraform changes found."
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No Terraform files found in the latest commit ($LATEST_SHA)."
+            echo "Assuming this is a non-infra update. Exiting."
+            echo "MODULE=" >> $GITHUB_ENV
             exit 0
           fi
 
+          # Extract the directory of the first file found in this commit
+          # (If you touched multiple folders in ONE commit, this picks the first one)
+          MODULE_DIR=$(echo "$CHANGED_FILES" | head -n 1 | xargs dirname)
 
-          # 3. Extract the directory
+          echo "✅ Detected Target Module: $MODULE_DIR"
+          echo "MODULE=$MODULE_DIR" >> $GITHUB_ENV
 
-          MODULE=$(dirname "$LATEST_FILE")
-
-          echo "Detected module: $MODULE"
-
-          echo "MODULE=$MODULE" >> $GITHUB_ENV
-      - name: Run FinOps Audit
+      - name: 🚀 Run FinOps Workflow
         if: env.MODULE != ''
         env:
-          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-          PR_NUMBER: '${{ github.event.pull_request.number }}'
-        run: "echo \"\U0001F3D7️  Auditing: $MODULE\"\npushd \"$MODULE\" > /dev/null\n\n# Terraform & Infracost\nterraform init -input=false\nterraform plan -out=plan.tfplan -input=false\nterraform show -json plan.tfplan > plan.json\ninfracost breakdown --path plan.json --format json --out-file infracost.json\n\n# Cost Calculation\nTOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n# Gemini Analysis\ncat > prompt.txt <<EOF\nAnalyze GCP FinOps for module: $MODULE\nCost: \\$$TOTAL\nData: $(cat infracost.json)\nEOF\n\njq -n --rawfile t prompt.txt '{contents:[{parts:[{text:$t}]}]}' > req.json\n\nRESPONSE=$(curl -sS -X POST \\\n  \"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent\" \\\n  -H \"Content-Type: application/json\" \\\n  -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n  --data-binary @req.json)\n\nAI_REVIEW=$(echo \"$RESPONSE\" | jq -r '.candidates[0].content.parts[0].text // \"Error\"')\n\n# PR Comment\ncat > comment.md <<EOF\n## \U0001F4B0 FinOps Audit: \\`$MODULE\\`\n**Monthly Cost:** \\$$TOTAL USD\n$AI_REVIEW\nEOF\n\ngh pr comment \"$PR_NUMBER\" --body-file comment.md\npopd > /dev/null\n"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MODULE="${{ env.MODULE }}"
+          echo "--- Starting Analysis for: $MODULE ---"
+          
+          # 1. Switch to Directory
+          cd "$MODULE" || { echo "❌ Directory not found"; exit 1; }
+          
+          # 2. Terraform Plan
+          terraform init -input=false
+          terraform plan -out=plan.tfplan -input=false
+          terraform show -json plan.tfplan > plan.json
+          
+          # 3. Infracost
+          infracost breakdown --path plan.json --format json --out-file infracost.json
+          
+          # 4. Extract Cost
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+          echo "💰 Monthly Cost: \$$TOTAL"
+          
+          # 5. Build Gemini Prompt (Safe JSON Method)
+          cat > prompt.txt <<EOF
+          You are a Senior GCP FinOps Architect.
+          
+          Analyze the Terraform module: "$MODULE"
+          Direct Monthly Cost: \$$TOTAL USD
+          
+          Tasks:
+          1. If cost > 0, recommend Spot instances or CUDs.
+          2. If cost is 0, identify "Shadow Costs" (NAT, Egress, Logging).
+          3. Rate the "Cost Risk" (Low/Medium/High).
+          
+          Return a concise Markdown table.
+          
+          RAW INFRACOST DATA:
+          $(cat infracost.json)
+          EOF
+          
+          # 6. Call Gemini
+          jq -n --rawfile t prompt.txt '{contents:[{parts:[{text:$t}]}]}' > gemini_req.json
+          
+          RESPONSE=$(curl -sS -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+            -H "Content-Type: application/json" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            --data-binary @gemini_req.json)
+            
+          AI_TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "⚠️ Analysis Failed"')
+          
+          # 7. Post Comment
+          cat > comment.md <<EOF
+          ## 💰 FinOps Audit: \`$MODULE\`
+          **Latest Commit Analysis**
+          
+          | Metric | Value |
+          |:---|:---|
+          | **Direct Cost** | **\$$TOTAL / month** |
+          
+          ### 🤖 Architect Recommendations
+          $AI_TEXT
+          
+          ---
+          *Triggered by commit: ${{ github.event.pull_request.head.sha }}*
+          EOF
+          
+          # Go back to root to run gh command
+          cd - > /dev/null
+          gh pr comment "$PR_NUMBER" --body-file "$MODULE/comment.md"
