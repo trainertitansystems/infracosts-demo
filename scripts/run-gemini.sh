@@ -2,17 +2,23 @@
 set -euo pipefail
 
 MODULE=$1
-TOTAL=$2
 
 cd "$MODULE"
 
-# Build compact cost summary (safe even if empty)
+if [ ! -f "infracost.json" ]; then
+  echo "Missing infracost.json in $MODULE"
+  exit 1
+fi
+
+# Compute total safely here (no external dependency)
+TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+
+# Build compact summary
 SUMMARY=$(jq -r '
   .projects[].breakdown.resources[]? |
   "\(.name) | \(.monthlyCost)"
 ' infracost.json | head -n 50 || true)
 
-# Build prompt safely
 cat > prompt.txt <<EOF
 ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)
 
@@ -31,17 +37,15 @@ If direct cost is 0, analyze usage-based shadow costs:
 Return markdown tables only.
 EOF
 
-# Convert to proper JSON safely
+# Safe JSON generation
 jq -Rs '{contents:[{parts:[{text:.}]}]}' prompt.txt > gemini_request.json
 
-# Call Gemini
 RESPONSE=$(curl -sS -X POST \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "Content-Type: application/json" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
   --data-binary @gemini_request.json)
 
-# Extract output safely
 echo "$RESPONSE" | jq -r '
   if .candidates then
     .candidates[0].content.parts[0].text
@@ -50,9 +54,6 @@ echo "$RESPONSE" | jq -r '
   else
     "Unknown Gemini Response"
   end
-' > ../.gemini_output
+' > .gemini_output
 
-# Fallback protection
-if [ ! -f ../.gemini_output ]; then
-  echo "Gemini did not return output" > ../.gemini_output
-fi
+echo "Gemini completed for module: $MODULE"
