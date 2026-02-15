@@ -1,103 +1,72 @@
 name: Terraform PR FinOps Gate
-
-on:
+'on':
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
-
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
-
 jobs:
   finops:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
-      - name: Detect changed modules (latest commit only)
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Detect changed module
         id: detect
-        run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
+        run: >
+          CHANGED_FILE=$(git diff --name-only origin/${{ github.base_ref }} |
+          grep '\.tf$' | head -n 1)
 
-          if [ -z "$CHANGED" ]; then
-            echo "modules=" >> $GITHUB_OUTPUT
+
+          if [ -z "$CHANGED_FILE" ]; then
+            echo "No Terraform changes detected"
             exit 0
           fi
 
-          MODULES=$(echo "$CHANGED" | xargs -I {} dirname {} | sort -u | tr '\n' ' ')
-          echo "modules=$MODULES" >> $GITHUB_OUTPUT
 
-      - name: Run FinOps per module
-        if: steps.detect.outputs.modules != ''
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODULE=$(dirname "$CHANGED_FILE")
+
+
+          if [ "$MODULE" = "." ]; then
+            echo "MODULE=." >> $GITHUB_ENV
+          else
+            echo "MODULE=$MODULE" >> $GITHUB_ENV
+          fi
+      - name: Run Terraform Plan
         run: |
-          for module in ${{ steps.detect.outputs.modules }}; do
+          cd "$MODULE"
+          terraform init -input=false
+          terraform plan -out=plan.tfplan -input=false
+          terraform show -json plan.tfplan > plan.json
+      - name: Run Infracost
+        run: >
+          cd "$MODULE"
 
-            echo "Processing module: $module"
-            cd "$module"
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost.json
 
-            terraform init -input=false
-            terraform plan -out=plan.tfplan -input=false
-            terraform show -json plan.tfplan > plan.json
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
+          // 0' infracost.json)
 
-            infracost breakdown --path plan.json --format json --out-file infracost.json
-
-            TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
-
-            echo "Total cost: $TOTAL"
-
-            cd -
-
-            {
-              echo "## 💰 FinOps Audit: \`$module\`"
-              echo ""
-              echo "| Field | Value |"
-              echo "|-------|-------|"
-              echo "| Direct Monthly Cost | \$${TOTAL} USD |"
-              echo ""
-              echo "### 🤖 AI Recommendation"
-              echo ""
-
-              if (( $(echo "$TOTAL > 0" | bc -l) )); then
-                echo "- Consider using smaller instance types or Spot/Preemptible VMs."
-                echo "- Evaluate disk sizing and committed use discounts."
-              else
-                echo "- No fixed cost detected."
-                echo "- Monitor usage-based costs such as network egress, NAT processing, logging ingestion, and load balancer data transfer."
-              fi
-
-              echo ""
-              echo "---"
-              echo "*Generated via Infracost*"
-            } > comment.md
-
-            gh pr comment "$PR_NUMBER" --body-file comment.md
-
-          done
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+      - name: Generate Recommendation
+        run: "cd \"$MODULE\"\n\nRESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u)\n\necho \"## \U0001F916 AI Recommendation\" > recommendation.md\necho \"\" >> recommendation.md\n\nfor RESOURCE in $RESOURCE_TYPES; do\n\n  case \"$RESOURCE\" in\n\n    google_pubsub_topic|google_pubsub_subscription)\n      echo \"- Pub/Sub is usage-based. Monitor message ingestion, retention duration, and egress traffic.\" >> recommendation.md\n      echo \"- Logging exports can increase costs.\" >> recommendation.md\n      ;;\n\n    google_compute_network|google_compute_subnetwork)\n      echo \"- VPC has no fixed cost but generates charges from egress, NAT processing, and load balancer data transfer.\" >> recommendation.md\n      echo \"- Monitor inter-zone and internet traffic.\" >> recommendation.md\n      ;;\n\n    google_compute_instance)\n      echo \"- Compute instance incurs fixed compute and disk cost.\" >> recommendation.md\n      echo \"- Consider rightsizing or using spot instances.\" >> recommendation.md\n      ;;\n\n    google_storage_bucket)\n      echo \"- Storage cost depends on data volume and operations.\" >> recommendation.md\n      echo \"- Monitor egress and lifecycle policies.\" >> recommendation.md\n      ;;\n\n    *)\n      echo \"- $RESOURCE may generate usage-based charges depending on traffic or storage usage.\" >> recommendation.md\n      ;;\n\n  esac\n\ndone\n"
+      - name: Comment on PR
+        env:
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: "cd \"$MODULE\"\n\necho \"## \U0001F4B0 FinOps Audit: $MODULE\" > comment.md\necho \"\" >> comment.md\necho \"| Field | Value |\" >> comment.md\necho \"|-------|-------|\" >> comment.md\necho \"| Direct Monthly Cost | \\$$TOTAL USD |\" >> comment.md\necho \"\" >> comment.md\ncat recommendation.md >> comment.md\necho \"\" >> comment.md\necho \"*Generated via Infracost*\" >> comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
