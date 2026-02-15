@@ -18,46 +18,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # --------------------------------------------------
-      # Checkout full repo history (needed for diff)
-      # --------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # --------------------------------------------------
-      # Install required tools
-      # --------------------------------------------------
-      - name: Install dependencies
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq bc
 
-      # --------------------------------------------------
-      # Authenticate to GCP (Workload Identity)
-      # --------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
 
-      # --------------------------------------------------
-      # Setup Terraform + Infracost
-      # --------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Setup Infracost CLI
+      - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # --------------------------------------------------
-      # Detect changed Terraform directories
-      # --------------------------------------------------
-      - name: Detect changed modules
+      - name: Detect changed Terraform directories (latest commit only)
         id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -66,33 +51,30 @@ jobs:
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
 
           if [ -z "$CHANGED" ]; then
-            echo "No Terraform changes detected."
-            echo "modules=" >> $GITHUB_OUTPUT
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
             exit 0
           fi
 
           DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-          echo "modules=$DIRS" >> $GITHUB_OUTPUT
+          echo "MODULES=$(echo $DIRS)" >> $GITHUB_ENV
 
-      # --------------------------------------------------
-      # Run Terraform + Infracost + Gemini per module
-      # --------------------------------------------------
       - name: Run FinOps Analysis
-        if: steps.detect.outputs.modules != ''
+        if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
 
-          for module in ${{ steps.detect.outputs.modules }}; do
+          for module in $MODULES; do
 
-            echo "-----------------------------------"
+            echo "------------------------------------"
             echo "Processing module: $module"
-            echo "-----------------------------------"
+            echo "------------------------------------"
 
             cd "$module"
 
-            rm -f plan.tfplan plan.json infracost.json
+            rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt gemini_request.json
 
             terraform init -input=false
             terraform plan -out=plan.tfplan -input=false
@@ -105,39 +87,29 @@ jobs:
 
             TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
+            SUMMARY=$(jq -r '
+              .projects[].breakdown.resources[] |
+              "\(.name) | $\(.monthlyCost)"
+            ' infracost.json | head -n 20)
+
             echo "Total monthly cost: $TOTAL"
 
-            # --------------------------------------------------
-            # Build safe Gemini prompt
-            # --------------------------------------------------
-            echo "ROLE: Senior GCP FinOps Architect (2026 Specialist)" > prompt.txt
-            echo "" >> prompt.txt
-            echo "Module: $module" >> prompt.txt
-            echo "Direct Monthly Cost: $TOTAL USD" >> prompt.txt
-            echo "" >> prompt.txt
-            echo "If direct cost is 0, analyze usage-based shadow costs including:" >> prompt.txt
-            echo "- NAT processing (0.045 USD/GB)" >> prompt.txt
-            echo "- Inter-zone egress (0.01 USD/GB)" >> prompt.txt
-            echo "- Logging ingestion (0.50 USD/GiB)" >> prompt.txt
-            echo "- Load balancer processing (0.008 USD/GB)" >> prompt.txt
-            echo "" >> prompt.txt
-            echo "Return markdown tables only." >> prompt.txt
+            # Build compact Gemini prompt (NO full JSON injection)
+            printf "ROLE: Senior GCP FinOps Architect (2026 Specialist)\n\n" > prompt.txt
+            printf "Analyze direct and hidden GCP cost exposure.\n\n" >> prompt.txt
+            printf "Module: %s\n" "$module" >> prompt.txt
+            printf "Direct Monthly Cost: %s USD\n\n" "$TOTAL" >> prompt.txt
+            printf "Resource Summary:\n%s\n\n" "$SUMMARY" >> prompt.txt
+            printf "If direct cost is 0, analyze shadow costs:\n" >> prompt.txt
+            printf "- Cloud NAT (0.045 USD/GB)\n" >> prompt.txt
+            printf "- Inter-zone egress (0.01 USD/GB)\n" >> prompt.txt
+            printf "- Log ingestion (0.50 USD/GiB)\n" >> prompt.txt
+            printf "- Load balancer processing (0.008 USD/GB)\n\n" >> prompt.txt
+            printf "Return markdown tables only.\n" >> prompt.txt
 
-            PROMPT_BASE64=$(base64 -w 0 prompt.txt)
-
-            jq -n \
-              --arg prompt "$PROMPT_BASE64" \
-              '{
-                contents: [
-                  {
-                    parts: [
-                      {
-                        text: ($prompt | @base64d)
-                      }
-                    ]
-                  }
-                ]
-              }' > gemini_request.json
+            jq -n --rawfile text prompt.txt \
+              '{contents:[{parts:[{text:$text}]}]}' \
+              > gemini_request.json
 
             RESPONSE=$(curl -sS -X POST \
               "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
@@ -145,37 +117,29 @@ jobs:
               -H "x-goog-api-key: ${GEMINI_API_KEY}" \
               --data-binary @gemini_request.json)
 
-            AI_OUTPUT=$(echo "$RESPONSE" | jq -r '
+            echo "$RESPONSE" | jq -r '
               if .candidates then
                 .candidates[0].content.parts[0].text
               elif .error then
                 "Gemini API Error: " + .error.message
               else
-                "Unknown Gemini response"
+                "Unknown Gemini Response"
               end
-            ')
+            ' > gemini.md
 
             cd -
 
-            # --------------------------------------------------
-            # Post PR Comment
-            # --------------------------------------------------
             {
-              echo "## 💰 FinOps Audit: $module"
-              echo ""
-              echo "| Field | Value |"
-              echo "|-------|-------|"
-              echo "| Direct Monthly Cost | \$${TOTAL} USD |"
-              echo ""
-              echo "---"
-              echo ""
-              echo "## 🤖 Gemini Architect Review"
-              echo ""
-              echo "$AI_OUTPUT"
-              echo ""
-              echo "_Generated via Infracost + Gemini 2.0 Flash_"
+              printf "## 💰 FinOps Audit: %s\n\n" "$module"
+              printf "| Field | Value |\n"
+              printf "| :--- | :--- |\n"
+              printf "| Direct Monthly Cost | $%s USD |\n\n" "$TOTAL"
+              printf "---\n"
+              printf "## 🤖 Gemini Architect Review\n\n"
+              cat "$module/gemini.md"
+              printf "\n\nGenerated via Gemini 2.0 Flash + Infracost\n"
             } > comment.md
 
-            gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+            gh pr comment "$PR_NUMBER" --body-file comment.md
 
           done
