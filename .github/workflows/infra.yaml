@@ -17,11 +17,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
-      - name: Authenticate GCP
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: >-
@@ -33,25 +31,27 @@ jobs:
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Detect changed module(s)
+      - name: Detect changed modules
         id: detect
-        run: |
+        run: >
           BASE="${{ github.event.pull_request.base.sha }}"
+
           HEAD="${{ github.event.pull_request.head.sha }}"
 
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' || true)
 
-          if [ -z "$CHANGED" ]; then
-            echo "NO_TF=true" >> $GITHUB_ENV
-            exit 0
+          MODULES=$(git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs
+          -I {} dirname {} | sort -u | tr '\n' ' ' || true)
+
+
+          if [ -z "$MODULES" ]; then
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          else
+            echo "MODULES=$MODULES" >> $GITHUB_ENV
           fi
-
-          MODULES=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-          echo "MODULES=$MODULES" >> $GITHUB_ENV
-      - name: Run FinOps Per Module
-        if: env.NO_TF != 'true'
+      - name: Run FinOps Audit
+        if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-          PR_NUMBER: '${{ github.event.pull_request.number }}'
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: "\nfor MODULE in $MODULES; do\n\n  echo \"Processing $MODULE\"\n\n  cd \"$MODULE\"\n\n  rm -f plan.tfplan plan.json infracost.json gemini.md request.json prompt.txt\n\n  terraform init -input=false\n  terraform plan -out=plan.tfplan -input=false\n  terraform show -json plan.tfplan > plan.json\n\n  infracost breakdown \\\n    --path plan.json \\\n    --format json \\\n    --out-file infracost.json\n\n  TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n  SUMMARY=$(jq -r '\n    .projects[].breakdown.resources[] |\n    \"\\(.name) | \\(.monthlyCost)\"\n  ' infracost.json | head -n 20)\n\n  echo \"Building Gemini prompt\"\n\n  echo \"You are a Senior GCP FinOps Architect.\" > prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"Module: $MODULE\" >> prompt.txt\n  echo \"Direct Monthly Cost: $TOTAL USD\" >> prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"Resource Summary:\" >> prompt.txt\n  echo \"$SUMMARY\" >> prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"For each resource:\" >> prompt.txt\n  echo \"- Classify as Fixed or Usage-Based\" >> prompt.txt\n  echo \"- Explain shadow costs such as egress, logging, scaling, load balancer processing\" >> prompt.txt\n  echo \"- Provide optimization recommendation\" >> prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"Return markdown tables only.\" >> prompt.txt\n\n  jq -n --rawfile text prompt.txt \\\n    '{contents:[{parts:[{text:$text}]}]}' > request.json\n\n  RESPONSE=$(curl -sS -X POST \\\n    https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \\\n    -H \"Content-Type: application/json\" \\\n    -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n    --data-binary @request.json)\n\n  echo \"$RESPONSE\" | jq -r '\n    if .candidates then\n      .candidates[0].content.parts[0].text\n    elif .error then\n      \"Gemini API Error: \" + .error.message\n    else\n      \"Gemini Unknown Error\"\n    end\n  ' > gemini.md\n\n  cd ..\n\n  {\n    echo \"## \U0001F4B0 FinOps Audit: $MODULE\"\n    echo \"\"\n    echo \"| Field | Value |\"\n    echo \"|-------|-------|\"\n    echo \"| Direct Monthly Cost | \\$${TOTAL} USD |\"\n    echo \"\"\n    echo \"## \U0001F916 Gemini Architect Review\"\n    echo \"\"\n    cat \"$MODULE/gemini.md\"\n    echo \"\"\n    echo \"---\"\n    echo \"*Generated via Gemini 2.0 Flash + Infracost*\"\n  } > comment.md\n\n  gh pr comment \"$PR_NUMBER\" --body-file comment.md\n\ndone\n"
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+        run: "for MODULE in $MODULES; do\n\n  echo \"Processing module: $MODULE\"\n\n  cd \"$MODULE\"\n\n  rm -f plan.tfplan plan.json infracost.json gemini.md request.json\n\n  terraform init -input=false\n  terraform plan -out=plan.tfplan -input=false\n  terraform show -json plan.tfplan > plan.json\n\n  infracost breakdown \\\n    --path plan.json \\\n    --format json \\\n    --out-file infracost.json\n\n  TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n  echo \"Total monthly cost: $TOTAL\"\n\n  # ----------------------------\n  # Build Gemini Prompt (SAFE)\n  # ----------------------------\n\n  echo \"You are a GCP FinOps Architect.\" > prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"Module: $MODULE\" >> prompt.txt\n  echo \"Direct Monthly Cost: $TOTAL USD\" >> prompt.txt\n  echo \"\" >> prompt.txt\n  echo \"Analyze ALL resources.\" >> prompt.txt\n  echo \"If direct cost is zero, explain usage-based shadow costs.\" >> prompt.txt\n  echo \"Consider egress, NAT, logging, load balancers, scaling.\" >> prompt.txt\n  echo \"Return markdown tables only.\" >> prompt.txt\n\n  jq -n --rawfile text prompt.txt '{contents:[{parts:[{text:$text}]}]}' > request.json\n\n  # ----------------------------\n  # Call Gemini Safely\n  # ----------------------------\n\n  RESPONSE=$(curl -sS -X POST \\\n    https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \\\n    -H \"Content-Type: application/json\" \\\n    -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n    --data-binary @request.json || echo \"CURL_FAILED\")\n\n  if [ \"$RESPONSE\" = \"CURL_FAILED\" ]; then\n    echo \"Gemini API Error: Curl failed\" > gemini.md\n  else\n    echo \"$RESPONSE\" | jq -e '.candidates' > /dev/null 2>&1\n\n    if [ $? -eq 0 ]; then\n      echo \"$RESPONSE\" | jq -r '.candidates[0].content.parts[0].text' > gemini.md\n    else\n      echo \"$RESPONSE\" | jq -r '.error.message // \"Gemini Unknown Error\"' > gemini.md 2>/dev/null || echo \"Gemini Invalid Response\" > gemini.md\n    fi\n  fi\n\n  cd ..\n\n  # ----------------------------\n  # Post PR Comment\n  # ----------------------------\n\n  echo \"## \U0001F4B0 FinOps Audit: $MODULE\" > comment.md\n  echo \"\" >> comment.md\n  echo \"| Field | Value |\" >> comment.md\n  echo \"|-------|-------|\" >> comment.md\n  echo \"| Direct Monthly Cost | \\$${TOTAL} USD |\" >> comment.md\n  echo \"\" >> comment.md\n  echo \"## \U0001F916 Gemini Review\" >> comment.md\n  echo \"\" >> comment.md\n  cat \"$MODULE/gemini.md\" >> comment.md\n  echo \"\" >> comment.md\n  echo \"_Generated via Gemini + Infracost_\" >> comment.md\n\n  gh pr comment \"$PR_NUMBER\" --body-file comment.md\n\ndone\n"
