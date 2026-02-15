@@ -24,9 +24,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -42,7 +40,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Detect changed Terraform modules (latest PR diff)
+      - name: Detect changed Terraform modules (latest PR diff only)
         id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -50,14 +48,13 @@ jobs:
 
           MODULES=$(git diff --name-only "$BASE" "$HEAD" \
             | grep '\.tf$' \
-            | xargs -r -n1 dirname \
-            | sort -u)
+            | xargs -I {} dirname {} \
+            | sort -u || true)
 
           if [ -z "$MODULES" ]; then
-            echo "No Terraform changes detected."
             echo "NO_CHANGES=true" >> $GITHUB_ENV
           else
-            echo "MODULE_LIST=$(echo $MODULES | tr '\n' ' ')" >> $GITHUB_ENV
+            echo "MODULE_LIST=$(echo "$MODULES" | tr '\n' ' ')" >> $GITHUB_ENV
           fi
 
       - name: Run FinOps per module
@@ -68,12 +65,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
 
+          REPO_ROOT=$(pwd)
+
           for MODULE in $MODULE_LIST; do
+
             echo "-----------------------------------------"
             echo "Processing module: $MODULE"
             echo "-----------------------------------------"
 
-            cd "$MODULE"
+            cd "$REPO_ROOT/$MODULE"
 
             rm -f plan.tfplan plan.json infracost.json
 
@@ -88,9 +88,6 @@ jobs:
 
             TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
-            echo "Total monthly cost: $TOTAL"
-
-            # Build compact resource summary (avoids Gemini JSON overflow)
             RESOURCE_SUMMARY=$(jq -r '
               .projects[].breakdown.resources[] |
               "- \(.name): $\(.monthlyCost)"
@@ -105,10 +102,10 @@ jobs:
             echo "$RESOURCE_SUMMARY" >> prompt.txt
             echo "" >> prompt.txt
             echo "If direct cost is 0, analyze usage-based shadow costs:" >> prompt.txt
-            echo "- Cloud NAT (0.045 USD/GB)" >> prompt.txt
-            echo "- Inter-zone egress (0.01 USD/GB)" >> prompt.txt
-            echo "- Log ingestion (0.50 USD/GiB)" >> prompt.txt
-            echo "- Load balancer processing (0.008 USD/GB)" >> prompt.txt
+            echo "- Cloud NAT: 0.045 USD/GB" >> prompt.txt
+            echo "- Inter-zone Egress: 0.01 USD/GB" >> prompt.txt
+            echo "- Log ingestion: 0.50 USD/GiB" >> prompt.txt
+            echo "- Load balancer processing: 0.008 USD/GB" >> prompt.txt
             echo "" >> prompt.txt
             echo "Return markdown tables only." >> prompt.txt
 
@@ -132,7 +129,7 @@ jobs:
               end
             ')
 
-            cd ..
+            cd "$REPO_ROOT"
 
             {
               echo "## 💰 FinOps Audit: $MODULE"
