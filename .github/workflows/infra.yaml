@@ -1,31 +1,27 @@
 name: Terraform PR FinOps Gate
-
-on:
+'on':
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
-
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-
 jobs:
   detect:
+    name: Detect Modified Terraform Modules
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set.outputs.matrix }}
-
+      matrix: '${{ steps.detect.outputs.matrix }}'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Detect changed Terraform folders
-        id: set
+        id: detect
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
@@ -41,103 +37,95 @@ jobs:
           JSON=$(printf '%s\n' $DIRS | jq -R . | jq -s -c .)
 
           echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
-
   finops:
+    name: Infracost + Gemini Analysis
     runs-on: ubuntu-latest
     needs: detect
-    if: needs.detect.outputs.matrix != '[]'
-
+    if: 'needs.detect.outputs.matrix != ''[]'''
     strategy:
       matrix:
-        module: ${{ fromJson(needs.detect.outputs.matrix) }}
-
+        module: '${{ fromJson(needs.detect.outputs.matrix) }}'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq bc
-
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          workload_identity_provider: >-
+            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
       - name: Setup Infracost CLI
         uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Generate Terraform Plan & Cost
+        working-directory: '${{ matrix.module }}'
+        run: >
+          terraform init -input=false
 
-      - name: Clean artifacts
-        working-directory: ${{ matrix.module }}
-        run: |
-          rm -f plan.tfplan plan.json infracost.json gemini.md prompt.txt || true
+          terraform plan -out=plan.tfplan -input=false
 
-      - name: Terraform Init
-        working-directory: ${{ matrix.module }}
-        run: terraform init -input=false
+          terraform show -json plan.tfplan > plan.json
 
-      - name: Terraform Plan
-        working-directory: ${{ matrix.module }}
-        run: terraform plan -out=plan.tfplan -input=false
 
-      - name: Export Plan JSON
-        working-directory: ${{ matrix.module }}
-        run: terraform show -json plan.tfplan > plan.json
-
-      - name: Run Infracost
-        working-directory: ${{ matrix.module }}
-        run: |
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
+          // 0' infracost.json)
+
           echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
+      - name: Build Gemini Request
+        working-directory: '${{ matrix.module }}'
+        run: >
+          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u
+          | tr '\n' ', ')
 
-      - name: Build Gemini Prompt
-        working-directory: ${{ matrix.module }}
-        run: |
-          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ', ')
+          INFRACOST_JSON=$(jq -c . infracost.json)
 
-          printf "ROLE: Senior GCP FinOps Architect\n\n" > prompt.txt
-          printf "Analyze direct and indirect cost exposure.\n\n" >> prompt.txt
-          printf "You must:\n" >> prompt.txt
-          printf -- "- Provide Fixed Monthly Floor.\n" >> prompt.txt
-          printf -- "- Provide Production Forecast Range.\n" >> prompt.txt
-          printf -- "- Identify Hidden Usage Costs (NAT, Egress, Logs, LB).\n" >> prompt.txt
-          printf -- "- Provide Risk Rating (Low/Medium/High).\n\n" >> prompt.txt
-          printf "2026 Pricing References:\n" >> prompt.txt
-          printf -- "- NAT = 0.045 USD per GB\n" >> prompt.txt
-          printf -- "- Inter-zone Egress = 0.01 USD per GB\n" >> prompt.txt
-          printf -- "- Log Ingestion = 0.50 USD per GiB\n\n" >> prompt.txt
-          printf "Module: %s\n" "${{ matrix.module }}" >> prompt.txt
-          printf "Direct Cost: %s USD\n" "$TOTAL" >> prompt.txt
-          printf "Terraform Resources: %s\n\n" "$RESOURCE_TYPES" >> prompt.txt
-          printf "RAW INFRACOST JSON:\n" >> prompt.txt
-          cat infracost.json >> prompt.txt
 
-          jq -n --rawfile text prompt.txt \
-            '{contents: [{parts: [{text: $text}]}]}' \
-            > gemini_request.json
-
+          jq -n \
+            --arg module "${{ matrix.module }}" \
+            --arg total "$TOTAL" \
+            --arg resources "$RESOURCE_TYPES" \
+            --arg infracost "$INFRACOST_JSON" \
+            '{
+              contents: [{
+                parts: [{
+                  text:
+                    "ROLE: Senior GCP FinOps Architect (2026 Pricing Specialist)\n\n" +
+                    "TASK: Analyze direct and hidden cost exposure.\n\n" +
+                    "OUTPUT FORMAT: Markdown tables only.\n\n" +
+                    "2026 Pricing References:\n" +
+                    "- Cloud NAT: 0.045 USD per GB\n" +
+                    "- Inter-zone Egress: 0.01 USD per GB\n" +
+                    "- Log Ingestion: 0.50 USD per GiB\n" +
+                    "- Load Balancer Processing: 0.008 USD per GB\n\n" +
+                    "Module: " + $module + "\n" +
+                    "Direct Cost: " + $total + " USD\n" +
+                    "Resources: " + $resources + "\n\n" +
+                    "Infracost JSON:\n" + $infracost
+                }]
+              }]
+            }' > gemini_request.json
       - name: Call Gemini API
-        working-directory: ${{ matrix.module }}
+        working-directory: '${{ matrix.module }}'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         run: |
           RESPONSE=$(curl -sS -X POST \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
             -H "Content-Type: application/json" \
             -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            -d @gemini_request.json)
+            --data-binary @gemini_request.json)
 
           echo "$RESPONSE" | jq -r '
             if .candidates then
@@ -145,21 +133,37 @@ jobs:
             elif .error then
               "Gemini API Error: " + .error.message
             else
-              "Gemini returned unexpected response"
+              "Unexpected Gemini response"
             end
           ' > gemini.md
-
       - name: Comment on PR
-        working-directory: ${{ matrix.module }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf "## Terraform Cost Analysis (%s)\n" "${{ matrix.module }}" > comment.md
-          printf "| Field | Value |\n" >> comment.md
-          printf -- "| :--- | :--- |\n" >> comment.md
-          printf "| Direct Monthly Cost | \$%s USD |\n\n" "$TOTAL" >> comment.md
-          printf -- "---\n\n" >> comment.md
-          printf "## Gemini FinOps Intelligence\n\n" >> comment.md
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        working-directory: '${{ matrix.module }}'
+        run: >
+          echo "## Terraform Cost Analysis (${ { matrix.module } })" >
+          comment.md
+
+          echo "" >> comment.md
+
+          echo "| Field | Value |" >> comment.md
+
+          echo "| :--- | :--- |" >> comment.md
+
+          echo "| Direct Monthly Cost | \$${TOTAL} USD |" >> comment.md
+
+          echo "" >> comment.md
+
+          echo "---" >> comment.md
+
+          echo "" >> comment.md
+
+          echo "## Gemini FinOps Intelligence" >> comment.md
+
+          echo "" >> comment.md
+
           cat gemini.md >> comment.md
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file
+          comment.md
