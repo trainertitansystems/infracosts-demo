@@ -1,33 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODULE_PATH=$1
-ROOT_DIR=$(pwd)
+MODULE=$1
+ROOT_DIR=$(pwd) # Capture root directory absolute path
 
-echo "🔍 Starting Terraform Analysis for: $MODULE_PATH"
+cd "$MODULE"
+rm -f plan.tfplan plan.json infracost.json
 
-cd "$MODULE_PATH"
-
-# Clean previous local artifacts
-rm -f plan.tfplan plan.json
-
-# Init and Plan
-terraform init -input=false -backend=false
+terraform init -input=false
 terraform plan -out=plan.tfplan -input=false
 terraform show -json plan.tfplan > plan.json
 
-# Run Infracost
 infracost breakdown \
   --path plan.json \
   --format json \
-  --out-file infracost_output.json
+  --out-file infracost.json
 
-# Save key data to ROOT_DIR for the next script
-# 1. Save the full JSON for Gemini
-cp infracost_output.json "$ROOT_DIR/.infracost_data.json"
+TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
 
-# 2. Extract total monthly cost
-TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost_output.json)
+# Fix: Use absolute path to root
 echo "$TOTAL" > "$ROOT_DIR/.total_cost"
-
-echo "✅ Cost calculated: \$$TOTAL"
