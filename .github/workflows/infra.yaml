@@ -15,82 +15,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq bc
-      - uses: hashicorp/setup-terraform@v3
-      - uses: infracost/actions/setup@v3
-        with:
-          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+          fetch-depth: 0
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: >-
             projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-terraform@siem-486017.iam.gserviceaccount.com
-      - name: Run Terraform + Infracost
-        id: cost
+      - uses: hashicorp/setup-terraform@v3
+      - uses: infracost/actions/setup@v3
+        with:
+          api-key: '${{ secrets.INFRACOST_API_KEY }}'
+      - name: Detect changed Terraform folders
+        id: detect
         run: >
-          terraform init -input=false
+          BASE="${{ github.event.pull_request.base.sha }}"
 
-          terraform plan -out=plan.tfplan -input=false
+          HEAD="${{ github.event.pull_request.head.sha }}"
 
-          terraform show -json plan.tfplan > plan.json
-
-
-          infracost breakdown \
-            --path plan.json \
-            --format json \
-            --out-file infracost.json
-
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
-          // 0' infracost.json)
+          git diff --name-only "$BASE" "$HEAD" | grep '\.tf$' | xargs -I {}
+          dirname {} | sort -u > modules.txt || true
 
 
-          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-
-          echo "Total monthly cost: $TOTAL"
-      - name: Build Gemini Request
-        run: |
-          echo "ROLE: Senior GCP FinOps Architect" > prompt.txt
-          echo "" >> prompt.txt
-          echo "Direct Monthly Cost: $TOTAL USD" >> prompt.txt
-          echo "" >> prompt.txt
-          echo "If cost is 0, analyze usage-based shadow costs:" >> prompt.txt
-          echo "- NAT processing" >> prompt.txt
-          echo "- Inter-zone egress" >> prompt.txt
-          echo "- Logging ingestion" >> prompt.txt
-          echo "- Load balancer processing" >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Return markdown tables only." >> prompt.txt
-          echo "" >> prompt.txt
-          echo "Infracost JSON:" >> prompt.txt
-          cat infracost.json >> prompt.txt
-
-          jq -n --rawfile text prompt.txt \
-            '{contents:[{parts:[{text:$text}]}]}' \
-            > gemini_request.json
-      - name: Call Gemini
+          if [ ! -s modules.txt ]; then
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          fi
+      - name: Run FinOps Review
+        if: env.NO_CHANGES != 'true'
         env:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-        run: |
-          RESPONSE=$(curl -sS -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
-            -H "Content-Type: application/json" \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            --data-binary @gemini_request.json)
-
-          echo "$RESPONSE" | jq -r '
-            if .candidates then
-              .candidates[0].content.parts[0].text
-            elif .error then
-              "Gemini API Error: " + .error.message
-            else
-              "Unknown Gemini Response"
-            end
-          ' > gemini_output.md
-      - name: Comment on PR
-        env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: "{\n  echo \"## \U0001F4B0 FinOps Audit\"\n  echo \"\"\n  echo \"| Field | Value |\"\n  echo \"|-------|-------|\"\n  echo \"| Direct Monthly Cost | \\$${TOTAL} USD |\"\n  echo \"\"\n  echo \"## \U0001F916 Gemini Review\"\n  echo \"\"\n  cat gemini_output.md\n  echo \"\"\n  echo \"_Generated via Gemini 2.0 Flash + Infracost_\"\n} > comment.md\n\ngh pr comment ${{ github.event.pull_request.number }} --body-file comment.md\n"
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+        run: "while read module; do\n\n  echo \"Processing $module\"\n  cd \"$module\"\n\n  terraform init -input=false\n  terraform plan -out=plan.tfplan -input=false\n  terraform show -json plan.tfplan > plan.json\n\n  infracost breakdown --path plan.json --format json --out-file infracost.json\n\n  TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)\n\n  SUMMARY=$(jq -r '.projects[].breakdown.resources[] | \"\\(.name) - \\(.monthlyCost) USD\"' infracost.json | head -n 20)\n\n  printf \"Senior GCP FinOps Architect Review\\n\\n\" > prompt.txt\n  printf \"Direct Monthly Cost: %s USD\\n\\n\" \"$TOTAL\" >> prompt.txt\n  printf \"Resources:\\n%s\\n\\n\" \"$SUMMARY\" >> prompt.txt\n  printf \"If cost is 0, analyze shadow costs:\\n\" >> prompt.txt\n  printf \"- NAT processing 0.045 USD per GB\\n\" >> prompt.txt\n  printf \"- Inter-zone egress 0.01 USD per GB\\n\" >> prompt.txt\n  printf \"- Logging ingestion 0.50 USD per GiB\\n\" >> prompt.txt\n  printf \"- Load balancer processing 0.008 USD per GB\\n\" >> prompt.txt\n  printf \"Return markdown tables only.\\n\" >> prompt.txt\n\n  jq -n --rawfile text prompt.txt '{contents:[{parts:[{text:$text}]}]}' > gemini_request.json\n\n  RESPONSE=$(curl -sS -X POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent \\\n    -H \"Content-Type: application/json\" \\\n    -H \"x-goog-api-key: ${GEMINI_API_KEY}\" \\\n    --data-binary @gemini_request.json)\n\n  echo \"$RESPONSE\" | jq -r 'if .candidates then .candidates[0].content.parts[0].text else \"Gemini Error\" end' > gemini.md\n\n  printf \"## \U0001F4B0 FinOps Audit: %s\\n\\n\" \"$module\" > comment.md\n  printf \"| Field | Value |\\n|-------|-------|\\n| Direct Monthly Cost | \\$%s USD |\\n\\n\" \"$TOTAL\" >> comment.md\n  printf \"---\\n\\n## \U0001F916 Gemini Review\\n\\n\" >> comment.md\n  cat gemini.md >> comment.md\n  printf \"\\n\\n_Generated via Gemini 2.0 Flash + Infracost_\\n\" >> comment.md\n\n  gh pr comment \"$PR_NUMBER\" --body-file comment.md\n\n  cd ..\n\ndone < modules.txt\n"
