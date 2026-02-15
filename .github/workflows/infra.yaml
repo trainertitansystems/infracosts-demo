@@ -1,14 +1,16 @@
 name: Terraform PR FinOps Gate
-'on':
+on:
   pull_request:
     branches:
       - main
     paths:
       - '**/*.tf'
+
 permissions:
   contents: read
   pull-requests: write
   id-token: write
+
 jobs:
   finops:
     runs-on: ubuntu-latest
@@ -16,23 +18,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 2 # Necessary to compare HEAD and HEAD~1
+
       - name: Install dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq bc
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: >-
-            projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-terraform@siem-486017.iam.gserviceaccount.com
+          workload_identity_provider: 'projects/464753796348/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-terraform@siem-486017.iam.gserviceaccount.com'
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
         with:
           api-key: '${{ secrets.INFRACOST_API_KEY }}'
-      - name: Detect changed module (last commit only)
+
+      - name: Detect changed module
+        id: detect
         run: |
+          # Compare last commit with its parent
           if git rev-parse HEAD~1 >/dev/null 2>&1; then
             CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' || true)
           else
@@ -40,51 +48,70 @@ jobs:
           fi
 
           if [ -z "$CHANGED" ]; then
-            echo "No Terraform changes in last commit"
+            echo "No Terraform changes detected."
             exit 0
           fi
 
-          DIRS=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
-          COUNT=$(echo "$DIRS" | wc -l | tr -d ' ')
-
-          if [ "$COUNT" -gt 1 ]; then
-            echo "Multiple modules modified in last commit:"
-            echo "$DIRS"
+          # Get the unique directory name
+          MODULE=$(echo "$CHANGED" | xargs -n1 dirname | sort -u)
+          
+          # Check if multiple directories were changed
+          if [ $(echo "$MODULE" | wc -l) -gt 1 ]; then
+            echo "Error: Multiple modules modified in one commit. This workflow supports one at a time."
+            echo "$MODULE"
             exit 1
           fi
 
-          MODULE="$DIRS"
           echo "Detected module: $MODULE"
           echo "MODULE=$MODULE" >> $GITHUB_ENV
+
       - name: Run Terraform & Infracost
-        run: >
-          cd "$MODULE"
-
-
-          rm -f plan.tfplan plan.json infracost.json
-
-
+        if: env.MODULE != ''
+        working-directory: ${{ env.MODULE }} # This handles the 'cd' automatically
+        run: |
           terraform init -input=false
-
           terraform plan -out=plan.tfplan -input=false
-
           terraform show -json plan.tfplan > plan.json
-
 
           infracost breakdown \
             --path plan.json \
             --format json \
             --out-file infracost.json
 
-          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add
-          // 0' infracost.json)
-
+          # Extract total and pass to ENV
+          TOTAL=$(jq '[.projects[].breakdown.totalMonthlyCost | tonumber] | add // 0' infracost.json)
           echo "TOTAL=$TOTAL" >> $GITHUB_ENV
-      - name: Build AI-style Recommendation
-        run: "cd \"$MODULE\"\n\nRESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\\n' ',')\n\necho \"## \U0001F4B0 FinOps Audit: $MODULE\" > ../comment.md\necho \"\" >> ../comment.md\necho \"| Field | Value |\" >> ../comment.md\necho \"|-------|-------|\" >> ../comment.md\necho \"| Direct Monthly Cost | \\$${TOTAL} USD |\" >> ../comment.md\necho \"\" >> ../comment.md\necho \"## \U0001F916 Cost Recommendation\" >> ../comment.md\necho \"\" >> ../comment.md\n\nif [ \"$TOTAL\" = \"0\" ] || [ \"$TOTAL\" = \"0.0\" ]; then\n  echo \"- No fixed cost detected.\" >> ../comment.md\n  echo \"- Review usage-based charges such as network egress, logging ingestion, NAT processing, load balancer traffic, and API calls.\" >> ../comment.md\nelse\n  echo \"- Fixed cost detected from provisioned resources.\" >> ../comment.md\n  echo \"- Consider smaller machine types, spot/preemptible instances, autoscaling, and storage optimization.\" >> ../comment.md\nfi\n\necho \"\" >> ../comment.md\necho \"_Generated via Infracost_\" >> ../comment.md\n"
+
+      - name: Build Report
+        if: env.MODULE != ''
+        working-directory: ${{ env.MODULE }}
+        run: |
+          # Collect resource types for the report
+          RESOURCE_TYPES=$(jq -r '.resource_changes[].type' plan.json | sort -u | tr '\n' ',' || echo "None")
+          
+          echo "## 💰 FinOps Audit: \`${{ env.MODULE }}\`" > ../comment.md
+          echo "" >> ../comment.md
+          echo "| Field | Value |" >> ../comment.md
+          echo "|-------|-------|" >> ../comment.md
+          echo "| Direct Monthly Cost | \$${{ env.TOTAL }} USD |" >> ../comment.md
+          echo "" >> ../comment.md
+          echo "## 🤖 Cost Recommendation" >> ../comment.md
+          echo "" >> ../comment.md
+
+          if [ "${{ env.TOTAL }}" = "0" ] || [ "${{ env.TOTAL }}" = "0.0" ]; then
+            echo "- **No fixed cost detected.**" >> ../comment.md
+            echo "- Review usage-based charges: Network Egress, NAT processing, and Logging ingestion." >> ../comment.md
+          else
+            echo "- **Fixed cost detected.**" >> ../comment.md
+            echo "- Optimization: Review instance sizing and consider Spot Instances for non-prod." >> ../comment.md
+          fi
+          
+          echo "" >> ../comment.md
+          echo "_Generated via Infracost Analysis_" >> ../comment.md
+
       - name: Post PR Comment
+        if: env.MODULE != ''
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body-file
-          comment.md
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
