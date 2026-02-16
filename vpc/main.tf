@@ -1,6 +1,4 @@
-#afdajdfkladflfd
-#adjflaj
-#fdajkfhkasfkakfakdfhkahfjk
+#test2 for Cost calculator
 terraform {
   required_providers {
     google = {
